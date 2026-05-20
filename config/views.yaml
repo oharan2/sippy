@@ -1607,6 +1607,7 @@ component_readiness:
       - lp-interop-acs
       - lp-interop-fusion-access
       - lp-interop-mta
+      - lp-interop-mycomp
       - lp-interop-quay
       - lp-interop-odf
       - lp-interop-oadp

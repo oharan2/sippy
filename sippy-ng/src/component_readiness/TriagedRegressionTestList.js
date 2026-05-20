@@ -1,10 +1,13 @@
+import { applyFilterModel, shouldKeepFilterItem } from '../datagrid/filterUtils'
+import { Chip, Tooltip, Typography } from '@mui/material'
 import { CompReadyVarsContext } from './CompReadyVars'
-import { DataGrid, GridToolbar } from '@mui/x-data-grid'
+import { DataGrid } from '@mui/x-data-grid'
 import { generateTestDetailsReportLink } from './CompReadyUtils'
 import { NumberParam, useQueryParam } from 'use-query-params'
-import { relativeTime } from '../helpers'
-import { Tooltip, Typography } from '@mui/material'
+import { relativeTime, SafeJSONParam } from '../helpers'
+import { symptomColor } from './CompReadyUtils'
 import CompSeverityIcon from './CompSeverityIcon'
+import GridToolbar from '../datagrid/GridToolbar'
 import PropTypes from 'prop-types'
 import React, { Fragment, useContext } from 'react'
 
@@ -21,10 +24,49 @@ export default function TriagedRegressionTestList(props) {
     NumberParam,
     { updateType: 'replaceIn' }
   )
+  const [filterModel = { items: [] }, setFilterModel] = useQueryParam(
+    'regressedModalTestFilters',
+    SafeJSONParam,
+    { updateType: 'replaceIn' }
+  )
 
   const [sortModel, setSortModel] = React.useState([
     { field: 'component', sort: 'asc' },
   ])
+
+  const addFilters = (filter) => {
+    const currentFilters = filterModel.items.filter(shouldKeepFilterItem)
+
+    filter.forEach((item) => {
+      if (shouldKeepFilterItem(item)) {
+        currentFilters.push(item)
+      }
+    })
+    setFilterModel({
+      items: currentFilters,
+      linkOperator: filterModel.linkOperator || 'and',
+    })
+  }
+
+  // Quick search functionality - searches test_name field
+  const requestSearch = (searchValue) => {
+    // Filter out empty items and existing test_name filters
+    const currentFilters = filterModel.items.filter(
+      (f) => shouldKeepFilterItem(f) && f.columnField !== 'test_name'
+    )
+    if (searchValue && searchValue !== '') {
+      currentFilters.push({
+        id: 99,
+        columnField: 'test_name',
+        operatorValue: 'contains',
+        value: searchValue,
+      })
+    }
+    setFilterModel({
+      items: currentFilters,
+      linkOperator: filterModel.linkOperator || 'and',
+    })
+  }
 
   const [triagedRegressions, setTriagedRegressions] = React.useState(
     props.regressions !== undefined ? props.regressions : []
@@ -50,14 +92,23 @@ export default function TriagedRegressionTestList(props) {
     )
   }
 
-  const showStatus =
-    props.allRegressedTests && props.allRegressedTests.length > 0
+  const regressedTestsByView = props.allRegressedTests || {}
+  // Sort view names to ensure the main view is first
+  const viewNames = [...Object.keys(regressedTestsByView)].sort((a, b) => {
+    const aMain = a.endsWith('-main')
+    const bMain = b.endsWith('-main')
+    if (aMain && !bMain) return -1
+    if (!aMain && bMain) return 1
+    return a.localeCompare(b)
+  })
+  const showStatus = viewNames.length > 0
 
   const columns = [
     {
       field: 'test_name',
       headerName: 'Test Name',
       flex: 50,
+      autocomplete: 'test_name',
       valueGetter: (params) => {
         return params.row.test_name
       },
@@ -67,6 +118,7 @@ export default function TriagedRegressionTestList(props) {
       field: 'release',
       headerName: 'Release',
       flex: 7,
+      autocomplete: 'release',
       valueGetter: (params) => {
         return params.row.release
       },
@@ -76,16 +128,69 @@ export default function TriagedRegressionTestList(props) {
       field: 'variants',
       headerName: 'Variants',
       flex: 20,
+      valueGetter: (params) => {
+        // Join array values into a searchable string
+        return params.row.variants && Array.isArray(params.row.variants)
+          ? params.row.variants.sort().join(' ')
+          : ''
+      },
       renderCell: (params) => (
         <div className="variants-list">
-          {params.value ? params.value.sort().join('\n') : ''}
+          {params.value ? params.value.split(' ').join('\n') : ''}
         </div>
       ),
     },
+    ...(props.symptomSummaries
+      ? [
+          {
+            field: 'symptoms',
+            headerName: 'Symptoms',
+            flex: 10,
+            filterable: false,
+            sortable: false,
+            valueGetter: (params) => {
+              const symptomIds = regressionSymptomMap[params.row.id]
+              return symptomIds ? [...symptomIds] : []
+            },
+            renderCell: (params) => {
+              if (!params.value || params.value.length === 0) return null
+              return (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 2 }}>
+                  {params.value.map((symptomId) => {
+                    const summary =
+                      props.symptomSummaries?.find(
+                        (ss) => ss.symptom.id === symptomId
+                      )?.symptom.summary || symptomId
+                    const label =
+                      summary.length > 12
+                        ? summary.substring(0, 12) + '…'
+                        : summary
+                    return (
+                      <Tooltip key={symptomId} title={summary}>
+                        <Chip
+                          label={label}
+                          size="small"
+                          sx={{
+                            backgroundColor: symptomColor(symptomId),
+                            color: '#fff',
+                            fontSize: '0.7rem',
+                            height: 20,
+                          }}
+                        />
+                      </Tooltip>
+                    )
+                  })}
+                </div>
+              )
+            },
+          },
+        ]
+      : []),
     {
       field: 'opened',
       headerName: 'Regressed Since',
       flex: 12,
+      filterable: false,
       valueGetter: (params) => {
         if (!params.row.opened) {
           // For a regression we haven't yet detected:
@@ -104,6 +209,7 @@ export default function TriagedRegressionTestList(props) {
       field: 'last_failure',
       headerName: 'Last Failure',
       flex: 12,
+      filterable: false,
       valueGetter: (params) => {
         if (!params.row.last_failure.Valid) {
           return null
@@ -121,60 +227,89 @@ export default function TriagedRegressionTestList(props) {
       },
     },
     ...(showStatus
-      ? [
-          {
-            field: 'status',
-            headerName: 'Status',
+      ? viewNames.map((viewName, index) => {
+          const field = `status_${index}`
+          return {
+            field,
+            headerName: viewName,
+            filterable: false,
             renderHeader: () => (
-              <Tooltip title="Status information is only available for regressions that have not rolled off the reporting window">
-                <span>Status</span>
+              <Tooltip title="Status for this view (base vs sample). Only available when the regression has not rolled off the reporting window.">
+                <span>{viewName}</span>
               </Tooltip>
             ),
             valueGetter: (params) => {
-              const value = {
-                status: '',
-                explanations: '',
-                url: '',
-              }
-              const regressionId = params.row.id
-              const matchingRegression = props.allRegressedTests.find(
-                (rt) => rt?.regression?.id === regressionId
-              )
-              if (matchingRegression) {
-                value.status = matchingRegression.status
-                value.explanations = matchingRegression.explanations
-                value.url = generateTestDetailsReportLink(
-                  matchingRegression,
+              const tests = regressedTestsByView[viewName] || []
+              const rt = tests.find((t) => t?.regression?.id === params.row.id)
+              if (!rt) return null
+              return {
+                status: rt.status,
+                explanations: rt.explanations,
+                url: generateTestDetailsReportLink(
+                  rt,
                   props.filterVals,
-                  expandEnvironment
-                )
+                  expandEnvironment,
+                  viewName
+                ),
               }
-              return value
             },
-            renderCell: (params) => (
-              <div
-                style={{
-                  textAlign: 'center',
-                }}
-                className="status"
-              >
-                <a
-                  href={params.value.url}
-                  target="_blank"
-                  rel="noopener noreferrer"
+            renderCell: (params) => {
+              if (params.value == null) return null
+              const item = params.value
+              return (
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                  }}
+                  className="status"
                 >
-                  <CompSeverityIcon
-                    status={params.value.status}
-                    explanations={params.value.explanations}
-                  />
-                </a>
-              </div>
-            ),
+                  <a href={item.url} target="_blank" rel="noopener noreferrer">
+                    <CompSeverityIcon
+                      status={item.status}
+                      explanations={item.explanations}
+                    />
+                  </a>
+                </div>
+              )
+            },
             flex: 6,
-          },
-        ]
+          }
+        })
       : []),
   ]
+
+  const regressionSymptomMap = React.useMemo(() => {
+    const map = {}
+    if (props.symptomSummaries) {
+      for (const ss of props.symptomSummaries) {
+        for (const regId of ss.regression_ids || []) {
+          if (!map[regId]) map[regId] = new Set()
+          map[regId].add(ss.symptom.id)
+        }
+      }
+    }
+    return map
+  }, [props.symptomSummaries])
+
+  const symptomFilteredRegressions = React.useMemo(() => {
+    if (!props.symptomFilter || !props.symptomSummaries) {
+      return triagedRegressions
+    }
+    const match = props.symptomSummaries.find(
+      (ss) => ss.symptom.id === props.symptomFilter
+    )
+    if (!match) return triagedRegressions
+    const matchingRegIds = new Set((match.regression_ids || []).map(Number))
+    return triagedRegressions.filter((r) => matchingRegIds.has(r.id))
+  }, [triagedRegressions, props.symptomFilter, props.symptomSummaries])
+
+  // Apply client-side filtering using shared utility
+  const filteredRegressions = React.useMemo(
+    () => applyFilterModel(symptomFilteredRegressions, filterModel, columns),
+    [symptomFilteredRegressions, filterModel, columns]
+  )
 
   return (
     <Fragment>
@@ -184,7 +319,7 @@ export default function TriagedRegressionTestList(props) {
           sortModel={sortModel}
           onSortModelChange={setSortModel}
           components={{ Toolbar: GridToolbar }}
-          rows={triagedRegressions}
+          rows={filteredRegressions}
           columns={columns}
           getRowHeight={() => 'auto'}
           getRowId={(row) => row.id}
@@ -205,6 +340,16 @@ export default function TriagedRegressionTestList(props) {
           componentsProps={{
             toolbar: {
               columns: columns,
+              addFilters: addFilters,
+              filterModel: filterModel,
+              setFilterModel: setFilterModel,
+              clearSearch: () => requestSearch(''),
+              doSearch: requestSearch,
+              autocompleteData: triagedRegressions,
+              downloadDataFunc: () => {
+                return filteredRegressions
+              },
+              downloadFilePrefix: 'triaged_test_regressions',
             },
           }}
         />
@@ -216,7 +361,9 @@ export default function TriagedRegressionTestList(props) {
 TriagedRegressionTestList.propTypes = {
   eventEmitter: PropTypes.object,
   regressions: PropTypes.array,
-  allRegressedTests: PropTypes.array,
+  allRegressedTests: PropTypes.object,
   filterVals: PropTypes.string,
   showOnLoad: PropTypes.bool,
+  symptomFilter: PropTypes.string,
+  symptomSummaries: PropTypes.array,
 }

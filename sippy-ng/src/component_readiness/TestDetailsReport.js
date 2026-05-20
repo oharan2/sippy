@@ -1,16 +1,20 @@
 import './ComponentReadiness.css'
 import { AccessibilityModeContext } from '../components/AccessibilityModeProvider'
 import {
+  Alert,
   Box,
   Button,
+  Chip,
   Grid,
   Popover,
   Tab,
   Tabs,
+  Tooltip,
   Typography,
 } from '@mui/material'
 import {
   cancelledDataTable,
+  convertApiUrlToUiUrl,
   getAPIUrl,
   getColumns,
   getStatusAndIcon,
@@ -24,7 +28,6 @@ import { FileCopy, Help } from '@mui/icons-material'
 import { Link } from 'react-router-dom'
 import { pathForExactTestAnalysisWithFilter } from '../helpers'
 import { ReleasesContext, SippyCapabilitiesContext } from '../App'
-import { Tooltip } from '@mui/material'
 import { usePageContextForChat } from '../chat/store/useChatStore'
 import AskSippyButton from '../chat/AskSippyButton'
 import BugButton from '../bugs/BugButton'
@@ -45,6 +48,7 @@ import TableBody from '@mui/material/TableBody'
 import TableCell from '@mui/material/TableCell'
 import TableRow from '@mui/material/TableRow'
 import TriagedTestsPanel from './TriagedTestsPanel'
+import TriageSymptoms from './TriageSymptoms'
 import UpsertTriageModal from './UpsertTriageModal'
 
 // Big query requests take a while so give the user the option to
@@ -109,6 +113,7 @@ export default function TestDetailsReport(props) {
   const [regressionId, setRegressionId] = React.useState(0)
   const [versions, setVersions] = React.useState({})
   const [triageEntries, setTriageEntries] = React.useState([])
+  const [symptomSummaries, setSymptomSummaries] = React.useState([])
   const releases = useContext(ReleasesContext)
   const hasSetContextRef = React.useRef(false)
 
@@ -127,6 +132,12 @@ export default function TestDetailsReport(props) {
   const copyTestID = (event) => {
     event.preventDefault()
     navigator.clipboard.writeText(testId)
+    setCopyPopoverEl(event.currentTarget)
+    setTimeout(() => setCopyPopoverEl(null), 2000)
+  }
+  const copyRegressionID = (event) => {
+    event.preventDefault()
+    navigator.clipboard.writeText(String(regressionId))
     setCopyPopoverEl(event.currentTarget)
     setTimeout(() => setCopyPopoverEl(null), 2000)
   }
@@ -201,10 +212,60 @@ export default function TestDetailsReport(props) {
   }, [hasBeenTriaged, urlParams, testId])
 
   useEffect(() => {
+    if (!data.analyses || !data.analyses[0]?.job_stats) {
+      setSymptomSummaries([])
+      return
+    }
+    const counts = {}
+    let totalFailedRuns = 0
+    for (const js of data.analyses[0].job_stats) {
+      for (const run of js.sample_job_run_stats || []) {
+        if (run.test_stats?.failure_count > 0) {
+          totalFailedRuns++
+          for (const sid of run.job_symptoms || []) {
+            counts[sid] = (counts[sid] || 0) + 1
+          }
+        }
+      }
+    }
+    const symptomIds = Object.keys(counts)
+    if (symptomIds.length === 0) {
+      setSymptomSummaries([])
+      return
+    }
+    const controller = new AbortController()
+    fetch(process.env.REACT_APP_API_URL + '/api/jobs/symptoms', {
+      signal: controller.signal,
+    })
+      .then((r) => r.json())
+      .then((allSymptoms) => {
+        const lookup = {}
+        for (const s of allSymptoms) {
+          lookup[s.id] = s.summary
+        }
+        const total = totalFailedRuns || 1
+        const summaries = symptomIds
+          .map((id) => ({
+            symptom: { id, summary: lookup[id] || id },
+            job_run_count: counts[id],
+            percentage: (counts[id] / total) * 100,
+          }))
+          .sort((a, b) => b.job_run_count - a.job_run_count)
+        setSymptomSummaries(summaries)
+      })
+      .catch((err) => {
+        if (err.name !== 'AbortError') {
+          setSymptomSummaries([])
+        }
+      })
+    return () => controller.abort()
+  }, [data])
+
+  useEffect(() => {
     let tmpRelease = {}
     releases.releases
       .filter((aVersion) => {
-        return !releases.release_attrs[aVersion].capabilities.componentReadiness
+        return releases.release_attrs[aVersion].capabilities.componentReadiness
       })
       .forEach((r) => {
         tmpRelease[r] = releases.ga_dates[r]
@@ -321,6 +382,8 @@ export default function TestDetailsReport(props) {
   const params = new URLSearchParams(url.search)
   const baseRelease = params.get('baseRelease')
 
+  const sampleIncludesInforming = data.lifecycle === 'informing'
+
   let isBaseOverride = false
   let baseReleaseTabLabel = baseRelease + ' Basis'
   let overrideReleaseTabLabel = ''
@@ -344,6 +407,17 @@ Successes: ${stats.success_count}
 Failures: ${stats.failure_count}
 Flakes: ${stats.flake_count}`
   }
+
+  // Convert API URL from data.links.latest to UI URL if present
+  const getLatestReportUrl = () => {
+    if (!data.links || !data.links.latest) {
+      return null
+    }
+
+    return convertApiUrlToUiUrl(data.links.latest)
+  }
+
+  const latestReportUrl = getLatestReportUrl()
 
   const getBugFilingComponent = () => {
     const hasBaseStats = data.analyses[0].base_stats
@@ -433,6 +507,14 @@ View the [test details report|${document.location.href}] for additional context.
         pageTitle={pageTitle}
         apiCallStr={testDetailsApiCall}
       />
+      {latestReportUrl && (
+        <Alert severity="warning" sx={{ marginTop: 2, marginBottom: 2 }}>
+          This report shows data from more than 48 hours ago.{' '}
+          <Link to={latestReportUrl} style={{ textDecoration: 'underline' }}>
+            View the latest report with data from the last 7 days
+          </Link>
+        </Alert>
+      )}
       <h3>
         <Link to="/component_readiness">
           / {environment} &gt; {component}
@@ -479,7 +561,7 @@ View the [test details report|${document.location.href}] for additional context.
             <Button
               variant="contained"
               color="secondary"
-              href="https://issues.redhat.com/issues/?filter=12432468"
+              href="https://redhat.atlassian.net/issues/?filter=102907"
             >
               View other open regressions
             </Button>
@@ -518,6 +600,23 @@ View the [test details report|${document.location.href}] for additional context.
               </IconButton>
             </TableCell>
           </TableRow>
+          {regressionId > 0 && (
+            <TableRow>
+              <TableCell>Regression ID:</TableCell>
+              <TableCell>
+                {regressionId}
+                <IconButton
+                  aria-label="Copy regression ID"
+                  color="inherit"
+                  onClick={copyRegressionID}
+                >
+                  <Tooltip title="Copy regression ID">
+                    <FileCopy />
+                  </Tooltip>
+                </IconButton>
+              </TableCell>
+            </TableRow>
+          )}
           <TableRow>
             <TableCell>Environment:</TableCell>
             <TableCell>{environment}</TableCell>
@@ -531,7 +630,19 @@ View the [test details report|${document.location.href}] for additional context.
           <TableRow>
             <TableCell>Assessment:</TableCell>
             <TableCell>
-              <Tooltip title={statusStr}>{assessmentIcon}</Tooltip>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                <Tooltip title={statusStr}>{assessmentIcon}</Tooltip>
+                {sampleIncludesInforming && (
+                  <Tooltip title="Test has lifecycle: Informing in the sample">
+                    <Chip
+                      aria-label="Informing lifecycle"
+                      label="Informing"
+                      size="small"
+                      color="info"
+                    />
+                  </Tooltip>
+                )}
+              </Box>
             </TableCell>
           </TableRow>
           <TableRow>
@@ -542,6 +653,7 @@ View the [test details report|${document.location.href}] for additional context.
           </TableRow>
         </TableBody>
       </Table>
+      <TriageSymptoms symptomSummaries={symptomSummaries} />
       {isBaseOverride ? (
         <Fragment>
           <Tabs

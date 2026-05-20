@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -37,12 +39,45 @@ func (jl *JiraLoader) Name() string {
 	return "jira"
 }
 
+// getAuthorizationHeader looks for environment variable settings
+// and returns the authorization string based on the setting present
+// if any.  UAT environment requires authentication
+// may be temporary when that becomes production
+// this will retrieve the authorization value if present
+
+func (jl *JiraLoader) getAuthorizationHeader() string {
+	// For a fresh sync to a developer DB, no jira token is needed since the issues API is still open. However, if
+	// we need to find cards where the trt-incident label was removed this API is not protected and returns 401
+	// if tried unauthed.  So really this only affects long-lived instances of Sippy.
+	//
+	// WARNING: DO NOT give public-facing Sippy a personal developer token, use a service account that is not marked
+	// as a Red Hat employee.
+
+	// bearer token supports service accounts
+	bearerToken := os.Getenv("JIRA_TOKEN")
+	if len(bearerToken) > 0 {
+		return fmt.Sprintf("Bearer %s", bearerToken)
+	}
+
+	// basic token supports personal access tokens
+	basicToken := os.Getenv("JIRA_TOKEN_BASIC")
+	if len(basicToken) > 0 {
+		return fmt.Sprintf("Basic %s", basicToken)
+	}
+
+	// may not be required so return empty string
+	log.Warningf("not all jira api queries are available without a token; some requests may fail")
+	return ""
+}
+
 func (jl *JiraLoader) Load() {
+	authorizationHeader := jl.getAuthorizationHeader()
+
 	// Load components into DB
-	jl.componentLoader()
+	jl.componentLoader(authorizationHeader)
 
 	// Load incidents
-	jl.incidentLoader()
+	jl.incidentLoader(authorizationHeader)
 }
 
 func (jl *JiraLoader) Errors() []error {
@@ -116,10 +151,10 @@ func issueContainsLabel(issue *v1jira.Issue, label string) bool {
 	return false
 }
 
-func (jl *JiraLoader) componentLoader() {
+func (jl *JiraLoader) componentLoader(authorization string) {
 	start := time.Now()
 	log.Infof("loading jira ocpbugs component information...")
-	body, err := jiraRequest("https://issues.redhat.com/rest/api/2/project/12332330/components")
+	body, err := jiraRequest("https://redhat.atlassian.net/rest/api/2/project/OCPBUGS/components", authorization)
 	if err != nil {
 		jl.errors = append(jl.errors, err)
 		return
@@ -173,7 +208,7 @@ func (jl *JiraLoader) componentLoader() {
 	}).Infof("component load complete in %+v", time.Since(start))
 }
 
-func (jl *JiraLoader) incidentLoader() {
+func (jl *JiraLoader) incidentLoader(authorization string) {
 	start := time.Now()
 	log.Infof("populating unresolved jira incident cache...")
 	var dbIssues []string
@@ -187,42 +222,70 @@ func (jl *JiraLoader) incidentLoader() {
 	start = time.Now()
 	log.Infof("fetching incidents from jira...")
 
-	body, err := jiraRequest("https://issues.redhat.com/rest/api/2/search?jql=labels%20%3D%20%22trt-incident%22%20AND%20updated%20%3E%3D%20-60d&expand=changelog")
-	if err != nil {
-		jl.errors = append(jl.errors, err)
-		return
-	}
+	baseURL := "https://redhat.atlassian.net/rest/api/3/search/jql?jql=labels%20%3D%20%22trt-incident%22%20AND%20updated%20%3E%3D%20-60d&fields=summary,created,labels,resolutiondate&expand=changelog"
+	nextPageToken := ""
+	pageCount := 0
+	totalIssues := 0
 
-	var issues struct {
-		Issues []v1jira.Issue `json:"issues"`
-	}
-	err = json.Unmarshal(body, &issues)
-	if err != nil {
-		jl.errors = append(jl.errors, err)
-		return
-	}
-
-	for i, issue := range issues.Issues {
-		unseenUnresolvedIssues.Delete(issue.Key)
-
-		model, err := issueToDB(&issues.Issues[i])
-		if err != nil {
-			log.WithError(err).Errorf("couldn't convert jira issue to db model")
-			continue
+	for {
+		pageCount++
+		apiURL := baseURL
+		if nextPageToken != "" {
+			apiURL = fmt.Sprintf("%s&nextPageToken=%s", baseURL, url.QueryEscape(nextPageToken))
 		}
-		if res := jl.dbc.DB.Save(model); res.Error != nil {
-			log.WithError(err).Errorf("couldn't save jira incident to DB")
+
+		log.Infof("fetching page %d of incidents...", pageCount)
+		body, err := jiraRequest(apiURL, authorization)
+		if err != nil {
 			jl.errors = append(jl.errors, err)
 			return
+		}
+
+		var response v1jira.SearchResponse
+		err = json.Unmarshal(body, &response)
+		if err != nil {
+			jl.errors = append(jl.errors, err)
+			return
+		}
+
+		log.Infof("processing %d issues from page %d", len(response.Issues), pageCount)
+		for i, issue := range response.Issues {
+			unseenUnresolvedIssues.Delete(issue.Key)
+
+			model, err := issueToDB(&response.Issues[i])
+			if err != nil {
+				log.WithError(err).Errorf("couldn't convert jira issue to db model")
+				continue
+			}
+			if res := jl.dbc.DB.Save(model); res.Error != nil {
+				log.WithError(res.Error).Errorf("couldn't save jira incident to DB")
+				jl.errors = append(jl.errors, res.Error)
+				return
+			}
+		}
+
+		totalIssues += len(response.Issues)
+
+		if response.IsLast {
+			log.Infof("reached last page (%d pages, %d total issues)", pageCount, totalIssues)
+			break
+		}
+
+		nextPageToken = response.NextPageToken
+		if nextPageToken == "" {
+			err := errors.Errorf("nextPageToken is empty but isLast is false, stopping pagination  (%d pages, %d processed issues)", pageCount, totalIssues)
+			log.Error(err)
+			jl.errors = append(jl.errors, err)
+			break
 		}
 	}
 
 	log.Infof("we have %d unseen and unresolved jira incidents", unseenUnresolvedIssues.Len())
 	for _, unseen := range unseenUnresolvedIssues.List() {
 		log.Infof("processing unseen, unresolved jira incidents (trt-incident label removed?)...")
-		issue, err := queryJiraAPI(unseen)
+		issue, err := queryJiraAPI(unseen, authorization)
 		if err != nil {
-			log.WithError(err).Errorf("couldn't query details for %+v", issue)
+			log.WithError(err).Warnf("couldn't query details for %s. this is expected for cards that are restricted to 'Red Hat Only'", unseen)
 			continue
 		}
 
@@ -232,8 +295,8 @@ func (jl *JiraLoader) incidentLoader() {
 			continue
 		}
 		if res := jl.dbc.DB.Save(model); res.Error != nil {
-			log.WithError(err).Errorf("couldn't save jira incident to DB")
-			jl.errors = append(jl.errors, err)
+			log.WithError(res.Error).Errorf("couldn't save jira incident to DB")
+			jl.errors = append(jl.errors, res.Error)
 			return
 		}
 	}
@@ -242,14 +305,19 @@ func (jl *JiraLoader) incidentLoader() {
 }
 
 // queryJiraAPI returns a singular jira issue
-func queryJiraAPI(issueID string) (*v1jira.Issue, error) {
-	urlFmtStr := "https://issues.redhat.com/rest/api/2/issue/%s?expand=changelog"
+func queryJiraAPI(issueID, authorization string) (*v1jira.Issue, error) {
+	urlFmtStr := "https://redhat.atlassian.net/rest/api/2/issue/%s?expand=changelog"
 	client := &http.Client{}
 	req, err := http.NewRequest("GET", fmt.Sprintf(urlFmtStr, issueID), nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := client.Do(req)
+
+	if authorization != "" {
+		req.Header.Add("Authorization", authorization)
+	}
+
+	resp, err := client.Do(req) //nolint:gosec // G704: URL is hardcoded to redhat.atlassian.net Jira API with issue key from Jira's own response
 	if err != nil {
 		return nil, err
 	}
@@ -298,34 +366,30 @@ func issueToDB(issue *v1jira.Issue) (*models.JiraIncident, error) {
 	}, nil
 }
 
-func jiraRequest(apiURL string) ([]byte, error) {
+func jiraRequest(apiURL, authorization string) ([]byte, error) {
 	client := &http.Client{}
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	// For a fresh sync to a developer DB, no jira token is needed since the issues API is still open. However, if
-	// we need to find cards where the trt-incident label was removed this API is not protected and returns 401
-	// if tried unauthed.  So really this only affects long-lived instances of Sippy.
-	//
-	// WARNING: DO NOT give public-facing Sippy a personal developer token, use a service account that is not marked
-	// as a Red Hat employee.
-	token := os.Getenv("JIRA_TOKEN")
-	if token == "" {
-		log.Warningf("not all jira api queries are available without a token; some requests may fail")
-	} else {
-		req.Header.Add("Authorization", "Bearer "+token)
+	if authorization != "" {
+		req.Header.Add("Authorization", authorization)
 	}
 
 	req.Header.Add("Accept", "application/json")
 	req.Header.Add("Content-Type", "application/json")
 
-	resp, err := client.Do(req)
+	resp, err := client.Do(req) //nolint:gosec // G704: URL is hardcoded to redhat.atlassian.net Jira API, pagination token is url.QueryEscape'd
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("jira request failed: %s (%s)", resp.Status, strings.TrimSpace(string(body)))
+	}
 
 	return io.ReadAll(resp.Body)
 }

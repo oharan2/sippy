@@ -6,7 +6,7 @@ import (
 
 	"github.com/openshift/sippy/pkg/api/componentreadiness/middleware"
 	"github.com/openshift/sippy/pkg/api/componentreadiness/utils"
-	"github.com/openshift/sippy/pkg/apis/api/componentreport/bq"
+	"github.com/openshift/sippy/pkg/apis/api/componentreport/crstatus"
 	"github.com/openshift/sippy/pkg/apis/api/componentreport/crtest"
 	"github.com/openshift/sippy/pkg/apis/api/componentreport/reqopts"
 	"github.com/openshift/sippy/pkg/apis/api/componentreport/testdetails"
@@ -32,7 +32,7 @@ type LinkInjector struct {
 	baseURL    string
 }
 
-func (l *LinkInjector) Query(ctx context.Context, wg *sync.WaitGroup, allJobVariants crtest.JobVariants, baseStatusCh, sampleStatusCh chan map[string]bq.TestStatus, errCh chan error) {
+func (l *LinkInjector) Query(ctx context.Context, wg *sync.WaitGroup, allJobVariants crtest.JobVariants, baseStatusCh, sampleStatusCh chan map[string]crstatus.TestStatus, errCh chan error) {
 	// unused
 }
 
@@ -70,10 +70,12 @@ func (l *LinkInjector) PostAnalysis(testKey crtest.Identification, testStats *te
 	testDetailsURL, err := utils.GenerateTestDetailsURL(
 		testKey.TestID,
 		l.baseURL,
+		l.reqOptions.ViewName, // Pass the view name if present
 		l.reqOptions.BaseRelease,
 		l.reqOptions.SampleRelease,
 		l.reqOptions.AdvancedOption,
 		l.reqOptions.VariantOption,
+		l.reqOptions.TestFilters,
 		testKey.Component,
 		testKey.Capability,
 		variants,
@@ -90,7 +92,7 @@ func (l *LinkInjector) PostAnalysis(testKey crtest.Identification, testStats *te
 	return nil
 }
 
-func (l *LinkInjector) PreTestDetailsAnalysis(testKey crtest.KeyWithVariants, status *bq.TestJobRunStatuses) error {
+func (l *LinkInjector) PreTestDetailsAnalysis(testKey crtest.KeyWithVariants, status *crstatus.TestJobRunStatuses) error {
 	// unused
 	return nil
 }

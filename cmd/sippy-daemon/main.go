@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/openshift/sippy/pkg/bigquery/bqlabel"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
@@ -94,9 +95,13 @@ func NewSippyDaemonCommand() *cobra.Command {
 					return errors.WithMessage(err, "couldn't get cache client")
 				}
 
+				opCtx := bqlabel.OperationalContext{
+					App:         bqlabel.AppSippy,
+					Command:     "sippy-daemon",
+					Environment: bqlabel.EnvDaemon,
+				}
 				var bigQueryClient *bigquery.Client
-				bigQueryClient, err = f.BigQueryFlags.GetBigQueryClient(context.Background(),
-					cacheClient, f.GoogleCloudFlags.ServiceAccountCredentialFile)
+				bigQueryClient, err = f.BigQueryFlags.GetBigQueryClient(context.Background(), opCtx, cacheClient, f.GoogleCloudFlags.ServiceAccountCredentialFile)
 				if err != nil {
 					return errors.WithMessage(err, "couldn't get bigquery client")
 				}
@@ -114,9 +119,7 @@ func NewSippyDaemonCommand() *cobra.Command {
 				// 4 potential GitHub calls per comment gives us a safe buffer
 				// get comment data, get existing comments, possible delete existing, and adding the comment
 				// could  lower to 3 seconds if we need, most writes likely won't have to delete
-				processes = append(processes, sippyserver.NewWorkProcessor(dbc,
-					gcsClient.Bucket(f.GoogleCloudFlags.StorageBucket),
-					10, bigQueryClient, 5*time.Minute, 5*time.Second, ghCommenter, f.GithubCommenterFlags.CommentProcessingDryRun))
+				processes = append(processes, sippyserver.NewWorkProcessor(dbc, bigQueryClient, gcsClient.Bucket(f.GoogleCloudFlags.StorageBucket), cacheClient, ghCommenter, 10, 5*time.Minute, 5*time.Second, f.GithubCommenterFlags.CommentProcessingDryRun))
 			}
 
 			daemonServer := sippyserver.NewDaemonServer(processes)

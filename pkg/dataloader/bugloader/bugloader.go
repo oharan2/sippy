@@ -12,6 +12,7 @@ import (
 
 	bqgo "cloud.google.com/go/bigquery"
 	"github.com/lib/pq"
+	"github.com/openshift/sippy/pkg/bigquery/bqlabel"
 	"github.com/openshift/sippy/pkg/db/query"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
@@ -211,9 +212,26 @@ var statusesForResolution = []string{
 	"Closed",
 }
 
+func triageBugLinked(t *models.Triage) bool {
+	return t.BugID != nil && t.Bug != nil && t.URL == t.Bug.URL
+}
+
+func skipTriageBugLoaderPass(resolved, bugLinked bool, triageDescription, bugSummary string) bool {
+	descriptionMatches := triageDescription == bugSummary
+	return resolved && bugLinked && descriptionMatches
+}
+
+func applyBugSummaryToTriageDescription(t *models.Triage, bugSummary string) bool {
+	if bugSummary == "" || t.Description == bugSummary {
+		return false
+	}
+	t.Description = bugSummary
+	return true
+}
+
 // updateTriages reconciles triage records with their associated bugs by:
 // 1. Linking triages to bug records and handling URL changes
-// 2. Auto-resolving triages when bugs reach "ON_QA" or higher status
+// 2. Auto-resolving triages when bugs reach "ON_QA" or higher status, only if the triage doesn't contain regressions from multiple releases
 func (bl *BugLoader) updateTriages(triages []models.Triage) {
 	logger := log.WithField("func", "bugloader.updateTriages")
 	logger.Infof("ensuring triages have correct refs to their bugs, and are resolved where appropriate")
@@ -222,32 +240,47 @@ func (bl *BugLoader) updateTriages(triages []models.Triage) {
 			continue // If we have no URL, we can't do anything
 		}
 
-		resolved := t.Resolved.Valid
-		bugLinked := t.BugID != nil && t.URL == t.Bug.URL
-		if resolved && bugLinked {
-			continue // There is no action to take
-		}
-
 		var bug models.Bug
 		res := bl.dbc.DB.Where("url = ?", t.URL).First(&bug)
 		if res.Error != nil {
 			// Someone could have put in a bad url, we won't let that error out our reconcile job.
-			logger.WithError(res.Error).Warnf("error looking up bug which should exist by this point: %s", t.URL)
+			logger.WithError(res.Error).Warnf("error looking up bug which should exist by this point: %s. this is expected for cards that are restricted to 'Red Hat Only'", t.URL)
 			continue
 		}
 
+		resolved := t.Resolved.Valid
+		bugLinked := triageBugLinked(&t)
+		if skipTriageBugLoaderPass(resolved, bugLinked, t.Description, bug.Summary) {
+			continue // There is no action to take
+		}
+
 		updated := false
-		// If the triage is not resolved, we should resolve it if the bug is at least in the "Modified" status
-		if !resolved && slices.Contains(statusesForResolution, bug.Status) {
+		if applyBugSummaryToTriageDescription(&t, bug.Summary) {
 			updated = true
-			now := time.Now()
-			t.Resolved = sql.NullTime{
-				Time:  now,
-				Valid: true,
+			logger.Infof("updated triage %d description from linked bug %d", t.ID, bug.ID)
+		}
+
+		// If the triage is not resolved, and it only contains regressions from a single release,
+		// then we should resolve it if the bug is at least in the "ON_QA" status
+		if !resolved && slices.Contains(statusesForResolution, bug.Status) {
+			releases := sets.New[string]()
+			for _, regression := range t.Regressions {
+				releases.Insert(regression.Release)
 			}
-			t.ResolutionReason = models.JiraProgression
-			logger.Infof("resolving triage %q (%d) due to bug %q (%d) reaching status %q",
-				t.Description, t.ID, bug.Summary, bug.ID, bug.Status)
+			if releases.Len() == 1 {
+				updated = true
+				now := time.Now()
+				t.Resolved = sql.NullTime{
+					Time:  now,
+					Valid: true,
+				}
+				t.ResolutionReason = models.JiraProgression
+				logger.Infof("resolving triage %q (%d) due to bug %q (%d) reaching status %q",
+					t.Description, t.ID, bug.Summary, bug.ID, bug.Status)
+			} else {
+				logger.Infof("not resolving triage %q (%d) because it contains regressions from multiple releases: %v",
+					t.Description, t.ID, releases.UnsortedList())
+			}
 		}
 
 		if !bugLinked {
@@ -291,7 +324,7 @@ func (bl *BugLoader) getTestBugMappings(ctx context.Context, testCache map[strin
         WHERE j.name != "upgrade"`,
 		TicketDataQuery, ComponentMappingProject, ComponentMappingDataset, ComponentMappingTable)
 	log.Debug(querySQL)
-	q := bl.bqc.BQ.Query(querySQL)
+	q := bl.bqc.Query(ctx, bqlabel.BugLoaderTestBugMappings, querySQL)
 
 	it, err := q.Read(ctx)
 	if err != nil {
@@ -394,7 +427,7 @@ func (bl *BugLoader) getJobBugMappings(ctx context.Context, jobCache map[string]
         OR STRPOS(t.comment, j.name) > 0
     `
 	log.Debug(querySQL)
-	q := bl.bqc.BQ.Query(querySQL)
+	q := bl.bqc.Query(ctx, bqlabel.BugLoaderJobBugMappings, querySQL)
 
 	it, err := q.Read(ctx)
 	if err != nil {
@@ -463,7 +496,7 @@ func (bl *BugLoader) getTriageBugMappings(ctx context.Context, triages []models.
 		`%s WHERE t.issue.key IN UNNEST(@keys)`,
 		sharedQuery)
 	log.Debug(querySQL)
-	q := bl.bqc.BQ.Query(querySQL)
+	q := bl.bqc.Query(ctx, bqlabel.BugLoaderTriageBugMappings, querySQL)
 	q.Parameters = append(q.Parameters, bqgo.QueryParameter{Name: "keys", Value: jiraKeys})
 
 	it, err := q.Read(ctx)
@@ -520,7 +553,7 @@ func bigQueryBugToModel(bqBug bigQueryBug) *models.Bug {
 		Components:      pq.StringArray(bqBug.Components),
 		Labels:          pq.StringArray(bqBug.Labels),
 		ReleaseBlocker:  bqBug.ReleaseBlocker,
-		URL:             fmt.Sprintf("https://issues.redhat.com/browse/%s", bqBug.Key),
+		URL:             fmt.Sprintf("https://redhat.atlassian.net/browse/%s", bqBug.Key),
 	}
 }
 

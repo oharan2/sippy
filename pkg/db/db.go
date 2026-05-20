@@ -11,7 +11,9 @@ import (
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 
+	sippymigrate "github.com/openshift/sippy/pkg/db/migrate"
 	"github.com/openshift/sippy/pkg/db/models"
+	"github.com/openshift/sippy/pkg/db/models/jobrunscan"
 )
 
 type SchemaHashType string
@@ -37,7 +39,7 @@ type log2LogrusWriter struct {
 	entry *log.Entry
 }
 
-func (w log2LogrusWriter) Printf(msg string, args ...interface{}) {
+func (w log2LogrusWriter) Printf(msg string, args ...any) {
 	w.entry.Debugf(msg, args...)
 }
 
@@ -65,104 +67,64 @@ func New(dsn string, logLevel gormlogger.LogLevel) (*DB, error) {
 }
 
 func (d *DB) UpdateSchema(reportEnd *time.Time) error {
-
-	if err := d.DB.AutoMigrate(&models.ReleaseTag{}); err != nil {
+	// Run versioned migrations (golang-migrate).
+	if err := sippymigrate.RunMigrations(d.DB); err != nil {
 		return err
 	}
 
-	if err := d.DB.AutoMigrate(&models.ReleasePullRequest{}); err != nil {
-		return err
+	// Register explicit join table so GORM uses our model (with release/timestamp)
+	// instead of auto-generating a bare join table.
+	if err := d.DB.SetupJoinTable(&models.ProwJobRun{}, "PullRequests", &models.ProwJobRunProwPullRequest{}); err != nil {
+		return fmt.Errorf("setup join table ProwJobRun.PullRequests: %w", err)
 	}
 
-	if err := d.DB.AutoMigrate(&models.ReleaseRepository{}); err != nil {
-		return err
+	// List of all models to migrate
+	modelsToMigrate := []any{
+		&models.ReleaseTag{},
+		&models.ReleasePullRequest{},
+		&models.ReleaseRepository{},
+		&models.ReleaseJobRun{},
+		&models.ProwJob{},
+		&models.ProwJobRun{},
+		&models.ProwJobRunAnnotation{},
+		&models.Test{},
+		&models.Suite{},
+		&models.ProwJobRunTest{},
+		&models.ProwJobRunTestOutput{},
+		&models.APISnapshot{},
+		&models.Bug{},
+		&models.ProwPullRequest{},
+		&models.ProwJobRunProwPullRequest{},
+		&models.SchemaHash{},
+		&models.PullRequestComment{},
+		&models.JiraIncident{},
+		&models.JiraComponent{},
+		&models.TestOwnership{},
+		&models.FeatureGate{},
+		&models.TestRegression{},
+		&models.RegressionJobRun{},
+		&models.RegressionView{},
+		&models.Triage{},
+		&models.TriageSymptom{},
+		&models.AuditLog{},
+		&models.ChatRating{},
+		&models.ChatConversation{},
+		&jobrunscan.Label{},
+		&jobrunscan.Symptom{},
 	}
 
-	if err := d.DB.AutoMigrate(&models.ReleaseJobRun{}); err != nil {
-		return err
-	}
-
-	if err := d.DB.AutoMigrate(&models.ProwJob{}); err != nil {
-		return err
-	}
-
-	if err := d.DB.AutoMigrate(&models.ProwJobRun{}); err != nil {
-		return err
-	}
-
-	if err := d.DB.AutoMigrate(&models.Test{}); err != nil {
-		return err
-	}
-
-	if err := d.DB.AutoMigrate(&models.Suite{}); err != nil {
-		return err
-	}
-
-	if err := d.DB.AutoMigrate(&models.ProwJobRunTest{}); err != nil {
-		return err
-	}
-
-	if err := d.DB.AutoMigrate(&models.ProwJobRunTestOutput{}); err != nil {
-		return err
-	}
-
-	if err := d.DB.AutoMigrate(&models.APISnapshot{}); err != nil {
-		return err
-	}
-
-	if err := d.DB.AutoMigrate(&models.Bug{}); err != nil {
-		return err
-	}
-
-	if err := d.DB.AutoMigrate(&models.ProwPullRequest{}); err != nil {
-		return err
-	}
-
-	if err := d.DB.AutoMigrate(&models.SchemaHash{}); err != nil {
-		return err
-	}
-
-	if err := d.DB.AutoMigrate(&models.PullRequestComment{}); err != nil {
-		return err
-	}
-
-	if err := d.DB.AutoMigrate(&models.JiraIncident{}); err != nil {
-		return err
-	}
-
-	if err := d.DB.AutoMigrate(&models.JiraComponent{}); err != nil {
-		return err
-	}
-
-	if err := d.DB.AutoMigrate(&models.TestOwnership{}); err != nil {
-		return err
-	}
-
-	if err := d.DB.AutoMigrate(&models.FeatureGate{}); err != nil {
-		return err
-	}
-
-	if err := d.DB.AutoMigrate(&models.TestRegression{}); err != nil {
-		return err
-	}
-
-	if err := d.DB.AutoMigrate(&models.Triage{}); err != nil {
-		return err
-	}
-
-	if err := d.DB.AutoMigrate(&models.AuditLog{}); err != nil {
-		return err
-	}
-
-	if err := d.DB.AutoMigrate(&models.ChatRating{}); err != nil {
-		return err
-	}
-
-	if err := d.DB.AutoMigrate(&models.ChatConversation{}); err != nil {
-		return err
+	// Migrate each model
+	for _, model := range modelsToMigrate {
+		if err := d.DB.AutoMigrate(model); err != nil {
+			return err
+		}
 	}
 
 	if err := createAuditLogIndexes(d.DB); err != nil {
+		return err
+	}
+
+	if err := ensureTriageSymptomCascade(d.DB); err != nil {
 		return err
 	}
 
@@ -171,10 +133,6 @@ func (d *DB) UpdateSchema(reportEnd *time.Time) error {
 	}
 
 	if err := syncPostgresMaterializedViews(d.DB, reportEnd); err != nil {
-		return err
-	}
-
-	if err := syncPartitionedTables(d.DB); err != nil {
 		return err
 	}
 
@@ -278,6 +236,42 @@ func createAuditLogIndexes(db *gorm.DB) error {
 	return nil
 }
 
+// ensureTriageSymptomCascade adds foreign keys to triage_symptoms with ON DELETE CASCADE
+// so that deleting a symptom definition or a regression automatically cleans up the
+// associated triage_symptoms rows.
+func ensureTriageSymptomCascade(db *gorm.DB) error {
+	constraints := []struct {
+		name string
+		sql  string
+	}{
+		{
+			name: "fk_triage_symptoms_symptom",
+			sql:  "ALTER TABLE triage_symptoms ADD CONSTRAINT fk_triage_symptoms_symptom FOREIGN KEY (symptom_id) REFERENCES job_run_symptoms(id) ON DELETE CASCADE",
+		},
+		{
+			name: "fk_triage_symptoms_regression",
+			sql:  "ALTER TABLE triage_symptoms ADD CONSTRAINT fk_triage_symptoms_regression FOREIGN KEY (regression_id) REFERENCES test_regressions(id) ON DELETE CASCADE",
+		},
+	}
+
+	for _, c := range constraints {
+		err := db.Exec(fmt.Sprintf(`
+			DO $$
+			BEGIN
+				IF NOT EXISTS (
+					SELECT 1 FROM pg_constraint
+					WHERE conname = '%s'
+				) THEN
+					%s;
+				END IF;
+			END $$`, c.name, c.sql)).Error
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func ParseGormLogLevel(logLevel string) (gormlogger.LogLevel, error) {
 	switch logLevel {
 	case "info":
@@ -289,6 +283,6 @@ func ParseGormLogLevel(logLevel string) (gormlogger.LogLevel, error) {
 	case "silent":
 		return gormlogger.Silent, nil
 	default:
-		return gormlogger.Info, fmt.Errorf("Unknown gorm LogLevel: %s", logLevel)
+		return gormlogger.Info, fmt.Errorf("unknown gorm LogLevel: %s", logLevel)
 	}
 }

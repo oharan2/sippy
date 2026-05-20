@@ -8,7 +8,7 @@ import (
 
 func ListTriages(dbc *db.DB) ([]models.Triage, error) {
 	var triages []models.Triage
-	res := dbc.DB.Preload("Bug").Preload("Regressions").Find(&triages)
+	res := dbc.DB.Preload("Bug").Preload("Regressions.JobRuns").Preload("Regressions.Views").Preload("Regressions").Find(&triages)
 	if res.Error != nil {
 		log.WithError(res.Error).Error("error listing all triages")
 	}
@@ -29,13 +29,10 @@ func ListOpenRegressions(dbc *db.DB, release string) ([]*models.TestRegression, 
 	return openRegressions, res.Error
 }
 
-func ListRegressions(dbc *db.DB, view, release string) ([]models.TestRegression, error) {
+func ListRegressions(dbc *db.DB, release string) ([]models.TestRegression, error) {
 	var regressions []models.TestRegression
-	query := dbc.DB.Model(&models.TestRegression{}).Preload("Triages")
+	query := dbc.DB.Model(&models.TestRegression{}).Preload("Triages").Preload("JobRuns").Preload("Views")
 
-	if view != "" {
-		query = query.Where("test_regressions.view = ?", view)
-	}
 	if release != "" {
 		query = query.Where("test_regressions.release = ?", release)
 	}

@@ -1,15 +1,79 @@
+import { applyFilterModel, shouldKeepFilterItem } from '../datagrid/filterUtils'
 import { CheckCircle, Error as ErrorIcon } from '@mui/icons-material'
-import { DataGrid, GridToolbar } from '@mui/x-data-grid'
-import { formatDateToSeconds, relativeTime } from '../helpers'
-import { hasFailedFixRegression, jiraUrlPrefix } from './CompReadyUtils'
+import { DataGrid } from '@mui/x-data-grid'
+import { formatDateToSeconds, relativeTime, SafeJSONParam } from '../helpers'
+import {
+  hasFailedFixRegression,
+  jiraUrlPrefix,
+  jiraUrlPrefixDeprecated,
+} from './CompReadyUtils'
 import { Link } from 'react-router-dom'
 import { NumberParam, StringParam, useQueryParam } from 'use-query-params'
 import { Tooltip, Typography } from '@mui/material'
 import { useTheme } from '@mui/material/styles'
 import CompSeverityIcon from './CompSeverityIcon'
+import GridToolbar from '../datagrid/GridToolbar'
 import InfoIcon from '@mui/icons-material/Info'
 import PropTypes from 'prop-types'
 import React, { Fragment, useEffect } from 'react'
+
+const bookmarks = [
+  {
+    name: 'Resolved',
+    model: [
+      {
+        id: 1,
+        columnField: 'resolution_date',
+        operatorValue: 'equals',
+        value: 'Resolved',
+      },
+    ],
+  },
+  {
+    name: 'Not Resolved',
+    model: [
+      {
+        id: 1,
+        columnField: 'resolution_date',
+        operatorValue: 'equals',
+        value: 'Unresolved',
+      },
+    ],
+  },
+  {
+    name: 'Release Blocker: Approved',
+    model: [
+      {
+        id: 1,
+        columnField: 'release_blocker',
+        operatorValue: 'equals',
+        value: 'approved',
+      },
+    ],
+  },
+  {
+    name: 'Release Blocker: Rejected',
+    model: [
+      {
+        id: 1,
+        columnField: 'release_blocker',
+        operatorValue: 'equals',
+        value: 'rejected',
+      },
+    ],
+  },
+  {
+    name: 'Release Blocker: Proposed',
+    model: [
+      {
+        id: 1,
+        columnField: 'release_blocker',
+        operatorValue: 'equals',
+        value: 'proposed',
+      },
+    ],
+  },
+]
 
 export default function TriagedRegressions({
   triageEntries,
@@ -37,6 +101,45 @@ export default function TriagedRegressions({
     NumberParam,
     { updateType: 'replaceIn' }
   )
+  const [filterModel = { items: [] }, setFilterModel] = useQueryParam(
+    'triageFilters',
+    SafeJSONParam,
+    { updateType: 'replaceIn' }
+  )
+
+  const addFilters = (filter) => {
+    const currentFilters = filterModel.items.filter(shouldKeepFilterItem)
+
+    filter.forEach((item) => {
+      if (shouldKeepFilterItem(item)) {
+        currentFilters.push(item)
+      }
+    })
+    setFilterModel({
+      items: currentFilters,
+      linkOperator: filterModel.linkOperator || 'and',
+    })
+  }
+
+  // Quick search functionality - searches description field
+  const requestSearch = (searchValue) => {
+    // Filter out empty items and existing description filters
+    const currentFilters = filterModel.items.filter(
+      (f) => shouldKeepFilterItem(f) && f.columnField !== 'description'
+    )
+    if (searchValue && searchValue !== '') {
+      currentFilters.push({
+        id: 99,
+        columnField: 'description',
+        operatorValue: 'contains',
+        value: searchValue,
+      })
+    }
+    setFilterModel({
+      items: currentFilters,
+      linkOperator: filterModel.linkOperator || 'and',
+    })
+  }
 
   useEffect(() => {
     if (activeRow) {
@@ -79,21 +182,25 @@ export default function TriagedRegressions({
     {
       field: 'resolution_date',
       valueGetter: (value) => {
-        return value.row.resolved?.Valid ? value.row.resolved.Time : ''
+        return value.row.resolved?.Valid ? 'Resolved' : 'Unresolved'
       },
       headerName: 'Resolved',
-      flex: 4,
+      flex: 2,
       align: 'center',
+      autocomplete: 'resolution_date',
       renderCell: (param) => {
         const triage = triageEntries.find((t) => t.id === param.row.id)
         const hasFailedFix = hasFailedFixRegression(triage, allRegressedTests)
+        const resolvedDate = param.row.resolved?.Valid
+          ? param.row.resolved.Time
+          : null
 
-        return param.value ? (
+        return resolvedDate ? (
           <Tooltip
             title={`${relativeTime(
-              new Date(param.value),
+              new Date(resolvedDate),
               new Date()
-            )} (${formatDateToSeconds(param.value)})`}
+            )} (${formatDateToSeconds(resolvedDate)})`}
           >
             {hasFailedFix ? (
               <CompSeverityIcon status={-1000} />
@@ -123,29 +230,39 @@ export default function TriagedRegressions({
         return value.row.type
       },
       headerName: 'Type',
-      flex: 5,
+      flex: 3,
+      autocomplete: 'type',
       renderCell: (param) => <div>{param.value}</div>,
     },
     {
-      field: 'url',
+      field: 'jira_key',
       valueGetter: (value) => {
         const url = value.row.url
-        const val = {
-          url,
-          text: url,
+        if (url && url.startsWith(jiraUrlPrefix)) {
+          return url.slice(jiraUrlPrefix.length)
+        } else if (url && url.startsWith(jiraUrlPrefixDeprecated)) {
+          return url.slice(jiraUrlPrefixDeprecated.length)
         }
-        if (url.startsWith(jiraUrlPrefix)) {
-          val.text = url.slice(jiraUrlPrefix.length)
-        }
-        return val
+        return url || ''
       },
       headerName: 'Jira',
-      flex: 5,
+      flex: 4,
+      autocomplete: 'jira_key',
       renderCell: (param) => (
-        <a target="_blank" href={param.value.url} rel="noreferrer">
-          <div className="test-name">{param.value.text}</div>
+        <a target="_blank" href={param.row.url} rel="noreferrer">
+          <div className="test-name">{param.value}</div>
         </a>
       ),
+    },
+    {
+      field: 'bug_component',
+      valueGetter: (value) => {
+        return value.row.bug?.components?.filter(Boolean).join(', ') || ''
+      },
+      headerName: 'Component',
+      flex: 4,
+      autocomplete: 'bug_component',
+      renderCell: (param) => <div className="test-name">{param.value}</div>,
     },
     {
       field: 'bug_state',
@@ -153,20 +270,20 @@ export default function TriagedRegressions({
         return value.row.bug?.status || ''
       },
       headerName: 'State',
-      flex: 5,
+      flex: 3,
+      autocomplete: 'bug_state',
       renderCell: (param) => <div className="test-name">{param.value}</div>,
     },
     {
       field: 'bug_version',
       valueGetter: (value) => {
-        return (
-          value.row.bug?.target_versions ||
-          value.row.bug?.affects_versions ||
-          ''
-        )
+        return value.row.bug?.target_versions?.filter(Boolean).length
+          ? value.row.bug.target_versions.filter(Boolean).join(', ')
+          : value.row.bug?.affects_versions?.filter(Boolean).join(', ') || ''
       },
       headerName: 'Version',
-      flex: 5,
+      flex: 4,
+      autocomplete: 'bug_version',
       renderCell: (param) => <div className="test-name">{param.value}</div>,
     },
     {
@@ -175,7 +292,8 @@ export default function TriagedRegressions({
         return value.row.bug?.release_blocker || ''
       },
       headerName: 'Release Blocker',
-      flex: 5,
+      flex: 4,
+      autocomplete: 'release_blocker',
       renderCell: (param) => <div className="test-name">{param.value}</div>,
     },
     {
@@ -184,7 +302,8 @@ export default function TriagedRegressions({
         return value.row.bug?.last_change_time || ''
       },
       headerName: 'Jira updated',
-      flex: 5,
+      flex: 4,
+      filterable: false,
       renderCell: (param) => (
         <Tooltip title={param.value}>
           <div className="test-name">
@@ -196,6 +315,7 @@ export default function TriagedRegressions({
     {
       field: 'created_at',
       hide: true,
+      filterable: false,
       valueGetter: (value) => {
         return value.row.created_at
       },
@@ -212,6 +332,7 @@ export default function TriagedRegressions({
     {
       field: 'updated_at',
       hide: true,
+      filterable: false,
       valueGetter: (value) => {
         return value.row.updated_at
       },
@@ -232,6 +353,7 @@ export default function TriagedRegressions({
       },
       headerName: 'Details',
       flex: 2,
+      filterable: false,
       renderCell: (param) => {
         const triageUrl = '/component_readiness/triages/' + param.value
         return (
@@ -243,6 +365,12 @@ export default function TriagedRegressions({
     },
   ]
 
+  // Apply client-side filtering using shared utility
+  const filteredTriageEntries = React.useMemo(
+    () => applyFilterModel(triageEntries, filterModel, columns),
+    [triageEntries, filterModel, columns]
+  )
+
   return (
     <Fragment>
       <Typography>Triaged Test Regressions</Typography>
@@ -252,7 +380,7 @@ export default function TriagedRegressions({
         selectionModel={activeRow}
         onSelectionModelChange={handleSetSelectionModel}
         components={{ Toolbar: GridToolbar }}
-        rows={triageEntries}
+        rows={filteredTriageEntries}
         columns={columns}
         getRowId={(row) => String(row.id)}
         pageSize={entriesPerPage}
@@ -265,7 +393,18 @@ export default function TriagedRegressions({
         checkboxSelection={false}
         componentsProps={{
           toolbar: {
+            bookmarks: bookmarks,
             columns: columns,
+            addFilters: addFilters,
+            filterModel: filterModel,
+            setFilterModel: setFilterModel,
+            clearSearch: () => requestSearch(''),
+            doSearch: requestSearch,
+            autocompleteData: triageEntries,
+            downloadDataFunc: () => {
+              return filteredTriageEntries
+            },
+            downloadFilePrefix: 'triaged_regressions',
           },
         }}
       />

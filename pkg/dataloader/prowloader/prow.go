@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -19,7 +20,12 @@ import (
 	"cloud.google.com/go/civil"
 	"cloud.google.com/go/storage"
 	"github.com/jackc/pgtype"
+	"github.com/lib/pq"
+	"github.com/openshift/sippy/pkg/bigquery/bqlabel"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/push"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/api/iterator"
 	"gorm.io/gorm"
@@ -38,6 +44,7 @@ import (
 	"github.com/openshift/sippy/pkg/db"
 	"github.com/openshift/sippy/pkg/db/models"
 	"github.com/openshift/sippy/pkg/github/commenter"
+	"github.com/openshift/sippy/pkg/releaseoverride"
 	"github.com/openshift/sippy/pkg/synthetictests"
 	"github.com/openshift/sippy/pkg/testidentification"
 	"github.com/openshift/sippy/pkg/util"
@@ -49,27 +56,31 @@ import (
 var gcsPathStrip = regexp.MustCompile(`.*/gs/[^/]+/`)
 
 type ProwLoader struct {
-	ctx                     context.Context
-	dbc                     *db.DB
-	errors                  []error
-	githubClient            *github.Client
-	bigQueryClient          *bqcachedclient.Client
-	maxConcurrency          int
-	prowJobCache            map[string]*models.ProwJob
-	prowJobCacheLock        sync.RWMutex
-	prowJobRunCache         map[uint]bool
-	prowJobRunCacheLock     sync.RWMutex
-	prowJobRunTestCache     map[string]uint
-	prowJobRunTestCacheLock sync.RWMutex
-	variantManager          testidentification.VariantManager
-	suiteCache              map[string]*uint
-	suiteCacheLock          sync.RWMutex
-	syntheticTestManager    synthetictests.SyntheticTestManager
-	releases                []string
-	config                  *v1config.SippyConfig
-	ghCommenter             *commenter.GitHubCommenter
-	jobsImportedCount       atomic.Int32
-	gcsClient               *storage.Client
+	ctx                          context.Context
+	dbc                          *db.DB
+	errors                       []error
+	githubClient                 *github.Client
+	bigQueryClient               *bqcachedclient.Client
+	maxConcurrency               int
+	prowJobCache                 map[string]*models.ProwJob
+	prowJobCacheLock             sync.RWMutex
+	prowJobRunCache              map[uint]bool
+	prowJobRunCacheLock          sync.RWMutex
+	prowJobRunTestCache          map[string]uint
+	prowJobRunTestCacheLock      sync.RWMutex
+	variantManager               testidentification.VariantManager
+	suiteCache                   map[string]*uint
+	suiteCacheLock               sync.RWMutex
+	syntheticTestManager         synthetictests.SyntheticTestManager
+	syntheticReleaseJobOverrides *releaseoverride.SyntheticReleaseOverrides
+	releases                     []string
+	config                       *v1config.SippyConfig
+	ghCommenter                  *commenter.GitHubCommenter
+	jobsImportedCount            atomic.Int32
+	jobsProcessedCount           atomic.Int32
+	gcsClient                    *storage.Client
+	promPusher                   *push.Pusher
+	loadSince                    *time.Time
 }
 
 func New(
@@ -82,28 +93,44 @@ func New(
 	syntheticTestManager synthetictests.SyntheticTestManager,
 	releases []string,
 	config *v1config.SippyConfig,
-	ghCommenter *commenter.GitHubCommenter) *ProwLoader {
+	ghCommenter *commenter.GitHubCommenter,
+	promPusher *push.Pusher,
+	loadSince *time.Time,
+	syntheticReleaseJobOverrides *releaseoverride.SyntheticReleaseOverrides) *ProwLoader {
 
 	return &ProwLoader{
-		ctx:                  ctx,
-		dbc:                  dbc,
-		gcsClient:            gcsClient,
-		githubClient:         githubClient,
-		bigQueryClient:       bigQueryClient,
-		maxConcurrency:       10,
-		prowJobRunCache:      loadProwJobRunCache(dbc),
-		prowJobCache:         loadProwJobCache(dbc),
-		prowJobRunTestCache:  make(map[string]uint),
-		suiteCache:           make(map[string]*uint),
-		syntheticTestManager: syntheticTestManager,
-		variantManager:       variantManager,
-		releases:             releases,
-		config:               config,
-		ghCommenter:          ghCommenter,
+		ctx:                          ctx,
+		dbc:                          dbc,
+		gcsClient:                    gcsClient,
+		githubClient:                 githubClient,
+		bigQueryClient:               bigQueryClient,
+		maxConcurrency:               10,
+		prowJobRunCache:              loadProwJobRunCache(dbc),
+		prowJobCache:                 loadProwJobCache(dbc),
+		prowJobRunTestCache:          make(map[string]uint),
+		suiteCache:                   make(map[string]*uint),
+		syntheticTestManager:         syntheticTestManager,
+		syntheticReleaseJobOverrides: syntheticReleaseJobOverrides,
+		variantManager:               variantManager,
+		releases:                     releases,
+		config:                       config,
+		ghCommenter:                  ghCommenter,
+		promPusher:                   promPusher,
+		loadSince:                    loadSince,
 	}
 }
 
 var clusterDataDateTimeName = regexp.MustCompile(`cluster-data_(?P<DATE>.*)-(?P<TIME>.*).json`)
+
+var prowLoaderQueriedMetricGauge = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "sippy_prow_jobs_loaded",
+	Help: "The number of jobs loaded (queried)",
+})
+
+var prowLoaderProcessedMetricGauge = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "sippy_prow_jobs_processed",
+	Help: "The number of jobs processed (new)",
+})
 
 type DateTimeName struct {
 	Name string
@@ -226,6 +253,13 @@ func (pl *ProwLoader) Load() {
 		log.Warningf("encountered %d errors while importing job runs", len(pl.errors))
 	}
 	log.Infof("finished importing new job runs in %+v", time.Since(start))
+
+	if pl.promPusher != nil {
+		prowLoaderQueriedMetricGauge.Set(float64(pl.jobsImportedCount.Load()))
+		pl.promPusher.Collector(prowLoaderQueriedMetricGauge)
+		prowLoaderProcessedMetricGauge.Set(float64(pl.jobsProcessedCount.Load()))
+		pl.promPusher.Collector(prowLoaderProcessedMetricGauge)
+	}
 }
 
 func prowJobsProducer(ctx context.Context, queue chan *prow.ProwJob, jobs []prow.ProwJob) {
@@ -371,7 +405,7 @@ func (pl *ProwLoader) loadDailyTestAnalysisByJob(ctx context.Context) error {
 		}
 		dLog.Warnf("partition created for releases %v", pl.releases)
 
-		q := pl.bigQueryClient.BQ.Query(fmt.Sprintf(`WITH
+		q := pl.bigQueryClient.Query(ctx, bqlabel.ProwLoaderTestAnalysis, fmt.Sprintf(`WITH
   deduped_testcases AS (
   SELECT
     junit.*,
@@ -506,6 +540,16 @@ func (pl *ProwLoader) processProwJob(ctx context.Context, pj *prow.ProwJob) erro
 		"buildID": pj.Status.BuildID,
 	})
 
+	// Synthetic release claims take priority over all other matching.
+	if release, ok := pl.syntheticReleaseJobOverrides.Lookup(pj.Spec.Job); ok {
+		if err := pl.prowJobToJobRun(ctx, pj, release); err != nil {
+			err = errors.Wrapf(err, "error converting prow job to job run: %s", pj.Spec.Job)
+			pjLog.WithError(err).Warning("prow import error")
+			return err
+		}
+		return nil
+	}
+
 	for _, release := range pl.releases {
 		cfg, ok := pl.config.Releases[release]
 		if !ok {
@@ -592,17 +636,15 @@ func (pl *ProwLoader) syncPRStatus() error {
 			// if we see that any sha has merged for this pr then we should clear out any risk analysis pending comment records
 			// if we don't get them here we will catch them before writing the risk analysis comment
 			// but, we should clean up here if possible
-			if recentMergedAt != nil {
-				pendingComments, err := pl.ghCommenter.QueryPRPendingComments(pr.Org, pr.Repo, pr.Number, models.CommentTypeRiskAnalysis)
+			pendingComments, err := pl.ghCommenter.QueryPRPendingComments(pr.Org, pr.Repo, pr.Number, models.CommentTypeRiskAnalysis)
 
-				if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-					logger.WithError(err).Error("Unable to fetch pending comments ")
-				}
+			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+				logger.WithError(err).Error("Unable to fetch pending comments ")
+			}
 
-				for _, pc := range pendingComments {
-					pcp := pc
-					pl.ghCommenter.ClearPendingRecord(pcp.Org, pcp.Repo, pcp.PullNumber, pcp.SHA, models.CommentTypeRiskAnalysis, &pcp)
-				}
+			for _, pc := range pendingComments {
+				pcp := pc
+				pl.ghCommenter.ClearPendingRecord(pcp.Org, pcp.Repo, pcp.PullNumber, pcp.SHA, models.CommentTypeRiskAnalysis, &pcp)
 			}
 		}
 	}
@@ -666,25 +708,6 @@ func GetClusterDataBytes(ctx context.Context, bkt *storage.BucketHandle, path st
 	}
 
 	return bytes, nil
-}
-
-func GetClusterData(ctx context.Context, bkt *storage.BucketHandle, path string, matches []string) models.ClusterData {
-	cd := models.ClusterData{}
-	bytes, err := GetClusterDataBytes(ctx, bkt, path, matches)
-	if err != nil {
-		log.WithError(err).Error("failed to get prow job variant data, returning empty cluster data and proceeding")
-		return cd
-	} else if bytes == nil {
-		log.Warnf("empty job variant data file, returning empty cluster data and proceeding")
-		return cd
-	}
-	err = json.Unmarshal(bytes, &cd)
-	if err != nil {
-		log.WithError(err).Error("failed to unmarshal cluster-data bytes, returning empty cluster data")
-		return cd
-	}
-
-	return cd
 }
 
 func ParseVariantDataFile(bytes []byte) (map[string]string, error) {
@@ -839,6 +862,31 @@ func (pl *ProwLoader) prowJobToJobRun(ctx context.Context, pj *prow.ProwJob, rel
 	// Lock the whole prow job block to avoid trying to create the pj multiple times concurrently\
 	// (resulting in a DB error)
 	pl.prowJobCacheLock.Lock()
+	dbProwJob, err := pl.createOrUpdateProwJob(ctx, pj, release, pjLog)
+	pl.prowJobCacheLock.Unlock()
+	if err != nil {
+		return err
+	}
+
+	pl.prowJobRunCacheLock.RLock()
+	_, ok := pl.prowJobRunCache[uint(id)]
+	pl.prowJobRunCacheLock.RUnlock()
+	if ok {
+		pjLog.Infof("processing complete; job run was already processed")
+		return nil
+	}
+
+	pjLog.Info("processing GCS bucket")
+	if err := pl.processGCSBucketJobRun(ctx, pj, id, path, junitMatches, dbProwJob); err != nil {
+		return err
+	}
+
+	pl.jobsProcessedCount.Add(1)
+	pjLog.Infof("processing complete")
+	return nil
+}
+
+func (pl *ProwLoader) createOrUpdateProwJob(ctx context.Context, pj *prow.ProwJob, release string, pjLog *log.Entry) (*models.ProwJob, error) {
 	dbProwJob, foundProwJob := pl.prowJobCache[pj.Spec.Job]
 	if !foundProwJob {
 		pjLog.Info("creating new ProwJob")
@@ -851,7 +899,7 @@ func (pl *ProwLoader) prowJobToJobRun(ctx context.Context, pj *prow.ProwJob, rel
 		}
 		err := pl.dbc.DB.WithContext(ctx).Clauses(clause.OnConflict{UpdateAll: true}).Create(dbProwJob).Error
 		if err != nil {
-			return errors.Wrapf(err, "error loading prow job into db: %s", pj.Spec.Job)
+			return nil, errors.Wrapf(err, "error loading prow job into db: %s", pj.Spec.Job)
 		}
 		pl.prowJobCache[pj.Spec.Job] = dbProwJob
 	} else {
@@ -862,6 +910,10 @@ func (pl *ProwLoader) prowJobToJobRun(ctx context.Context, pj *prow.ProwJob, rel
 			dbProwJob.Variants = newVariants
 			saveDB = true
 		}
+		if dbProwJob.Release != release {
+			dbProwJob.Release = release
+			saveDB = true
+		}
 		if len(dbProwJob.TestGridURL) == 0 {
 			dbProwJob.TestGridURL = pl.generateTestGridURL(release, pj.Spec.Job).String()
 			if len(dbProwJob.TestGridURL) > 0 {
@@ -870,63 +922,87 @@ func (pl *ProwLoader) prowJobToJobRun(ctx context.Context, pj *prow.ProwJob, rel
 		}
 		if saveDB {
 			if res := pl.dbc.DB.WithContext(ctx).Save(&dbProwJob); res.Error != nil {
-				return res.Error
+				return nil, res.Error
 			}
 		}
 	}
-	pl.prowJobCacheLock.Unlock()
+	return dbProwJob, nil
+}
 
-	pl.prowJobRunCacheLock.RLock()
-	_, ok := pl.prowJobRunCache[uint(id)]
-	pl.prowJobRunCacheLock.RUnlock()
-	if ok {
-		pjLog.Infof("job run was already processed")
-	} else {
-		pjLog.Info("processing GCS bucket")
+func (pl *ProwLoader) processGCSBucketJobRun(ctx context.Context, pj *prow.ProwJob, id uint64, path string, junitMatches []string, dbProwJob *models.ProwJob) error {
+	tests, failures, overallResult, err := pl.prowJobRunTestsFromGCS(ctx, pj, uint(id), dbProwJob.ID, dbProwJob.Release, path, junitMatches)
+	if err != nil {
+		return err
+	}
 
-		tests, failures, overallResult, err := pl.prowJobRunTestsFromGCS(ctx, pj, uint(id), path, junitMatches)
-		if err != nil {
-			return err
-		}
+	pulls := pl.findOrAddPullRequests(pj.Spec.Refs, path)
 
-		pulls := pl.findOrAddPullRequests(pj.Spec.Refs, path)
+	labels, err := GatherLabelsFromBQ(ctx, pl.bigQueryClient, pj.Status.BuildID, pj.Status.StartTime)
+	if err != nil {
+		return err
+	}
 
-		var duration time.Duration
-		if pj.Status.CompletionTime != nil {
-			duration = pj.Status.CompletionTime.Sub(pj.Status.StartTime)
-		}
+	var annotations []models.ProwJobRunAnnotation
+	for k, v := range pj.Annotations {
+		annotations = append(annotations, models.ProwJobRunAnnotation{
+			Key:                 k,
+			Value:               v,
+			ProwJobRunRelease:   dbProwJob.Release,
+			ProwJobRunTimestamp: pj.Status.StartTime,
+		})
+	}
 
-		err = pl.dbc.DB.WithContext(ctx).Create(&models.ProwJobRun{
+	var duration time.Duration
+	if pj.Status.CompletionTime != nil {
+		duration = pj.Status.CompletionTime.Sub(pj.Status.StartTime)
+	}
+
+	err = pl.dbc.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&models.ProwJobRun{
 			Model: gorm.Model{
 				ID: uint(id),
 			},
-			Cluster:       pj.Spec.Cluster,
-			Duration:      duration,
-			ProwJob:       *dbProwJob,
-			ProwJobID:     dbProwJob.ID,
-			URL:           pj.Status.URL,
-			GCSBucket:     pj.Spec.DecorationConfig.GCSConfiguration.Bucket,
-			Timestamp:     pj.Status.StartTime,
-			OverallResult: overallResult,
-			PullRequests:  pulls,
-			TestFailures:  failures,
-			Succeeded:     overallResult == sippyprocessingv1.JobSucceeded,
-		}).Error
-		if err != nil {
+			Cluster:        pj.Spec.Cluster,
+			Duration:       duration,
+			ProwJob:        *dbProwJob,
+			ProwJobID:      dbProwJob.ID,
+			ProwJobRelease: dbProwJob.Release,
+			URL:            pj.Status.URL,
+			GCSBucket:      pj.Spec.DecorationConfig.GCSConfiguration.Bucket,
+			Timestamp:      pj.Status.StartTime,
+			OverallResult:  overallResult,
+			TestFailures:   failures,
+			Succeeded:      overallResult == sippyprocessingv1.JobSucceeded,
+			Labels:         labels,
+			Annotations:    annotations,
+		}).Error; err != nil {
 			return err
 		}
-		// Looks like sometimes, we might be getting duplicate entries from bigquery:
-		pl.prowJobRunCacheLock.Lock()
-		pl.prowJobRunCache[uint(id)] = true
-		pl.prowJobRunCacheLock.Unlock()
 
-		err = pl.dbc.DB.WithContext(ctx).Debug().CreateInBatches(tests, 1000).Error
-		if err != nil {
-			return err
+		for _, pull := range pulls {
+			if err := tx.Create(&models.ProwJobRunProwPullRequest{
+				ProwJobRunID:        uint(id),
+				ProwPullRequestID:   pull.ID,
+				ProwJobRunRelease:   dbProwJob.Release,
+				ProwJobRunTimestamp: pj.Status.StartTime,
+			}).Error; err != nil {
+				return err
+			}
 		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
+	// Looks like sometimes, we might be getting duplicate entries from bigquery:
+	pl.prowJobRunCacheLock.Lock()
+	pl.prowJobRunCache[uint(id)] = true
+	pl.prowJobRunCacheLock.Unlock()
 
-	pjLog.Infof("processing complete")
+	err = pl.dbc.DB.WithContext(ctx).Debug().CreateInBatches(tests, 1000).Error
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1036,6 +1112,55 @@ func (pl *ProwLoader) findOrAddPullRequests(refs *prow.Refs, pjPath string) []mo
 	return pulls
 }
 
+const LabelsDatasetEnv = "JOB_LABELS_DATASET"
+const LabelsTableName = "job_labels"
+
+// GatherLabelsFromBQ queries BigQuery for labels associated with this job run.
+// Labels are stored in the job_labels table and indexed by prowjob_build_id.
+func GatherLabelsFromBQ(ctx context.Context, bqClient *bqcachedclient.Client, buildID string, startTime time.Time) (pq.StringArray, error) {
+	if bqClient == nil {
+		return nil, nil
+	}
+	logger := log.WithField("buildID", buildID)
+
+	dataset := os.Getenv(LabelsDatasetEnv)
+	if dataset == "" {
+		dataset = bqClient.Dataset
+	}
+	table := fmt.Sprintf("`%s.%s`", dataset, LabelsTableName)
+	q := bqClient.Query(ctx, bqlabel.ProwLoaderJobLabels, `
+		SELECT ARRAY_AGG(DISTINCT label ORDER BY label ASC) AS labels
+		FROM `+table+`
+		WHERE prowjob_build_id = @BuildID
+		  AND DATE(prowjob_start) = DATE(@StartTime)
+	`)
+	q.Parameters = []bigquery.QueryParameter{
+		{
+			Name:  "BuildID",
+			Value: buildID,
+		},
+		{
+			Name:  "StartTime",
+			Value: startTime,
+		},
+	}
+
+	var result struct {
+		Labels []string `bigquery:"labels"`
+	}
+	it, err := q.Read(ctx)
+	if err != nil {
+		logger.WithError(err).Warning("error querying labels from bigquery")
+		return nil, err
+	}
+	if err = it.Next(&result); err != nil && err != iterator.Done {
+		logger.WithError(err).Warning("error parsing labels from bigquery")
+		return nil, err
+	}
+
+	return result.Labels, nil
+}
+
 func (pl *ProwLoader) findOrAddTest(name string) (uint, error) {
 	pl.prowJobRunTestCacheLock.RLock()
 	if id, ok := pl.prowJobRunTestCache[name]; ok {
@@ -1075,18 +1200,12 @@ func (pl *ProwLoader) findSuite(name string) *uint {
 
 	pl.suiteCacheLock.Lock()
 	defer pl.suiteCacheLock.Unlock()
-	suite := &models.Suite{}
-	pl.dbc.DB.Where("name = ?", name).Find(&suite)
-	if suite.ID == 0 {
-		pl.suiteCache[name] = nil
-	} else {
-		id := suite.ID
-		pl.suiteCache[name] = &id
-	}
-	return pl.suiteCache[name]
+	id := db.GetSuiteID(pl.dbc.DB, name)
+	pl.suiteCache[name] = id
+	return id
 }
 
-func (pl *ProwLoader) prowJobRunTestsFromGCS(ctx context.Context, pj *prow.ProwJob, id uint, path string, junitPaths []string) ([]*models.ProwJobRunTest, int, sippyprocessingv1.JobOverallResult, error) {
+func (pl *ProwLoader) prowJobRunTestsFromGCS(ctx context.Context, pj *prow.ProwJob, id, prowJobID uint, prowJobRelease, path string, junitPaths []string) ([]*models.ProwJobRunTest, int, sippyprocessingv1.JobOverallResult, error) {
 	failures := 0
 
 	bkt := pl.gcsClient.Bucket(pj.Spec.DecorationConfig.GCSConfiguration.Bucket)
@@ -1105,7 +1224,7 @@ func (pl *ProwLoader) prowJobRunTestsFromGCS(ctx context.Context, pj *prow.ProwJ
 			continue
 		}
 
-		pl.extractTestCases(suite, suiteID, testCases)
+		pl.extractTestCases(suite, suiteID, testCases, prowJobRelease, pj.Status.StartTime)
 	}
 
 	syntheticSuite, jobResult := testconversion.ConvertProwJobRunToSyntheticTests(*pj, testCases, pl.syntheticTestManager)
@@ -1115,7 +1234,7 @@ func (pl *ProwLoader) prowJobRunTestsFromGCS(ctx context.Context, pj *prow.ProwJ
 		// this shouldn't happen but if it does we want to know
 		panic("synthetic suite is missing from the database")
 	}
-	pl.extractTestCases(syntheticSuite, suiteID, testCases)
+	pl.extractTestCases(syntheticSuite, suiteID, testCases, prowJobRelease, pj.Status.StartTime)
 	log.Infof("synthetic suite had %d tests", syntheticSuite.NumTests)
 
 	results := make([]*models.ProwJobRunTest, 0)
@@ -1125,6 +1244,9 @@ func (pl *ProwLoader) prowJobRunTestsFromGCS(ctx context.Context, pj *prow.ProwJ
 		}
 
 		testCases[k].ProwJobRunID = id
+		testCases[k].ProwJobID = prowJobID
+		testCases[k].ProwJobRunRelease = prowJobRelease
+		testCases[k].ProwJobRunTimestamp = pj.Status.StartTime
 		results = append(results, testCases[k])
 		if testCases[k].Status == 12 {
 			failures++
@@ -1134,7 +1256,7 @@ func (pl *ProwLoader) prowJobRunTestsFromGCS(ctx context.Context, pj *prow.ProwJ
 	return results, failures, jobResult, nil
 }
 
-func (pl *ProwLoader) extractTestCases(suite *junit.TestSuite, suiteID *uint, testCases map[string]*models.ProwJobRunTest) {
+func (pl *ProwLoader) extractTestCases(suite *junit.TestSuite, suiteID *uint, testCases map[string]*models.ProwJobRunTest, prowJobRelease string, prowJobStartTime time.Time) {
 
 	for _, tc := range suite.TestCases {
 		if testidentification.IsIgnoredTest(tc.Name) {
@@ -1149,7 +1271,9 @@ func (pl *ProwLoader) extractTestCases(suite *junit.TestSuite, suiteID *uint, te
 			status = sippyprocessingv1.TestStatusSuccess
 		default:
 			failureOutput = &models.ProwJobRunTestOutput{
-				Output: tc.FailureOutput.Output,
+				Output:                  tc.FailureOutput.Output,
+				ProwJobRunTestTimestamp: prowJobStartTime,
+				ProwJobRunTestRelease:   prowJobRelease,
 			}
 		}
 
@@ -1182,6 +1306,6 @@ func (pl *ProwLoader) extractTestCases(suite *junit.TestSuite, suiteID *uint, te
 	}
 
 	for _, c := range suite.Children {
-		pl.extractTestCases(c, suiteID, testCases)
+		pl.extractTestCases(c, suiteID, testCases, prowJobRelease, prowJobStartTime)
 	}
 }

@@ -19,6 +19,10 @@ type RequestOptions struct {
 	CacheOption    cache.RequestOptions
 	TestFilters
 	TestIDOptions []TestIdentification
+	// ViewName is the name of the view used for this request, if any.
+	// When generating test details URLs, if a view is present, we include just the view parameter
+	// plus test-specific overrides, rather than expanding all view parameters into the URL.
+	ViewName string `json:"view_name,omitempty" yaml:"view_name,omitempty"`
 }
 
 // PullRequest specifies a specific pull request to use as the
@@ -59,7 +63,7 @@ type RelativeRelease struct {
 // TestFilters are query filters on attributes of the tests themselves, as opposed to the jobs they run in
 type TestFilters struct {
 	Capabilities []string `json:"capabilities,omitempty" yaml:"capabilities,omitempty"`
-	// we will likely have more later
+	Lifecycles   []string `json:"lifecycles,omitempty" yaml:"lifecycles,omitempty"`
 }
 
 // TestIdentification handles options used in the test details report when we focus in
@@ -107,4 +111,9 @@ type Advanced struct {
 	IgnoreDisruption            bool `json:"ignore_disruption" yaml:"ignore_disruption"`
 	FlakeAsFailure              bool `json:"flake_as_failure" yaml:"flake_as_failure"`
 	IncludeMultiReleaseAnalysis bool `json:"include_multi_release_analysis" yaml:"include_multi_release_analysis"`
+	// KeyTestNames contains test names that, when they fail in a job, cause all other test failures
+	// in that job to be excluded from regression analysis. This is used to filter out mass failures
+	// caused by fundamental infrastructure issues (e.g., install failures, upgrade failures).
+	// When multiple key tests fail in the same job, only the highest priority (earliest in list) test is included.
+	KeyTestNames []string `json:"key_test_names,omitempty" yaml:"key_test_names,omitempty"`
 }

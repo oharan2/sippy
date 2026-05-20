@@ -16,7 +16,7 @@ var PostgresMatViews = []PostgresView{
 	{
 		Name:         "prow_test_report_7d_matview",
 		Definition:   testReportMatView,
-		IndexColumns: []string{"id", "name", "release", "variants", "suite_name"},
+		IndexColumns: []string{"release", "name", "id", "variants", "suite_name"},
 		ReplaceStrings: map[string]string{
 			"|||START|||":    "|||TIMENOW||| - INTERVAL '14 DAY'",
 			"|||BOUNDARY|||": "|||TIMENOW||| - INTERVAL '7 DAY'",
@@ -26,7 +26,7 @@ var PostgresMatViews = []PostgresView{
 	{
 		Name:         "prow_test_report_2d_matview",
 		Definition:   testReportMatView,
-		IndexColumns: []string{"id", "name", "release", "variants", "suite_name"},
+		IndexColumns: []string{"release", "name", "id", "variants", "suite_name"},
 		ReplaceStrings: map[string]string{
 			"|||START|||":    "|||TIMENOW||| - INTERVAL '9 DAY'",
 			"|||BOUNDARY|||": "|||TIMENOW||| - INTERVAL '2 DAY'",
@@ -205,6 +205,7 @@ SELECT prow_job_runs.id,
    (EXTRACT(epoch FROM (prow_job_runs."timestamp" AT TIME ZONE 'utc'::text)) * 1000::numeric)::bigint AS "timestamp",
    prow_job_runs.id AS prow_id,
    prow_job_runs.cluster AS cluster,
+   prow_job_runs.labels as labels,
    flaked_test_results.test_names AS flaked_test_names,
    flaked_test_results.test_count AS test_flakes,
    failed_test_results.test_names AS failed_test_names,

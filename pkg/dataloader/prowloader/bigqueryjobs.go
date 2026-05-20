@@ -1,11 +1,12 @@
 package prowloader
 
 import (
-	"context"
 	"strconv"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/bigquery"
+	"github.com/openshift/sippy/pkg/bigquery/bqlabel"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/api/iterator"
@@ -18,30 +19,37 @@ func (pl *ProwLoader) fetchProwJobsFromOpenShiftBigQuery() ([]prow.ProwJob, []er
 
 	// Figure out our last imported job timestamp:
 	var lastProwJobRun time.Time
-	row := pl.dbc.DB.Table("prow_job_runs").Select("max(timestamp)").Row()
-	err := row.Scan(&lastProwJobRun)
-	if err != nil || lastProwJobRun.IsZero() {
-		log.WithError(err).Warn("no last prow job run found (new database?), importing last two weeks")
-		lastProwJobRun = time.Now().Add(-14 * 24 * time.Hour)
+	if pl.loadSince != nil {
+		lastProwJobRun = *pl.loadSince
+		log.Infof("Using manually specified load-since time: %s", lastProwJobRun.UTC().Format(time.RFC3339))
 	} else {
-		// adjust the last job run time, we're querying all jobs that have completed since our last recorded
-		// job START time, but we need to subtract our max job runtime in-case a job ended early and was our last
-		// imported start time, while others that started before it hadn't completed yet.
-		// 12 hours should safely cover our max timeout.
-		lastProwJobRun = lastProwJobRun.Add(-12 * time.Hour)
+		row := pl.dbc.DB.Table("prow_job_runs").Select("max(timestamp)").Row()
+		err := row.Scan(&lastProwJobRun)
+		if err != nil || lastProwJobRun.IsZero() {
+			log.WithError(err).Warn("no last prow job run found (new database?), importing last two weeks")
+			lastProwJobRun = time.Now().Add(-14 * 24 * time.Hour)
+		} else {
+			// adjust the last job run time, we're querying all jobs that have completed since our last recorded
+			// job START time, but we need to subtract our max job runtime in-case a job ended early and was our last
+			// imported start time, while others that started before it hadn't completed yet.
+			// 12 hours should safely cover our max timeout.
+			lastProwJobRun = lastProwJobRun.Add(-12 * time.Hour)
+		}
 	}
 	log.Infof("Loading prow jobs from bigquery completed since: %s", lastProwJobRun.UTC().Format(time.RFC3339))
 
 	// NOTE: casting a couple datetime columns to timestamps, it does appear they go in as UTC, and thus come out
 	// as the default UTC correctly.
 	// Annotations and labels can be queried here if we need them.
-	query := pl.bigQueryClient.BQ.Query(`SELECT
+	query := pl.bigQueryClient.Query(pl.ctx, bqlabel.ProwLoaderProwJobs, `
+        SELECT
 			prowjob_job_name,
 			prowjob_state,
 			prowjob_build_id,
 			prowjob_type,
 			prowjob_cluster,
 			prowjob_url,
+			prowjob_annotations,
 			pr_sha,
 			pr_author,
 			pr_number,
@@ -49,8 +57,8 @@ func (pl *ProwLoader) fetchProwJobsFromOpenShiftBigQuery() ([]prow.ProwJob, []er
 			repo,
 			gcs_bucket,
 			TIMESTAMP(prowjob_start) AS prowjob_start_ts,
-			TIMESTAMP(prowjob_completion) AS prowjob_completion_ts ` +
-		"FROM `ci_analysis_us.jobs` " +
+			TIMESTAMP(prowjob_completion) AS prowjob_completion_ts `+
+		"FROM `ci_analysis_us.jobs` "+
 		`WHERE TIMESTAMP(prowjob_completion) > @queryFrom
 	       AND prowjob_url IS NOT NULL
 	       ORDER BY prowjob_start_ts`)
@@ -60,7 +68,7 @@ func (pl *ProwLoader) fetchProwJobsFromOpenShiftBigQuery() ([]prow.ProwJob, []er
 			Value: lastProwJobRun,
 		},
 	}
-	it, err := query.Read(context.TODO())
+	it, err := query.Read(pl.ctx)
 	if err != nil {
 		errs = append(errs, err)
 		log.WithError(err).Error("error querying jobs from bigquery")
@@ -102,6 +110,21 @@ func (pl *ProwLoader) fetchProwJobsFromOpenShiftBigQuery() ([]prow.ProwJob, []er
 			// Do not return an error as that will cause the job to fail.
 			continue
 		}
+		// Filter out annotations with excluded prefixes
+		filteredAnnotations := make(map[string]string)
+		for _, a := range bqjr.Annotations {
+			parts := strings.SplitN(a, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			key := parts[0]
+			value := parts[1]
+			if strings.HasPrefix(key, "prow.k8s.io") || strings.HasPrefix(key, "ci.openshift.io") {
+				continue
+			}
+			filteredAnnotations[key] = value
+		}
+
 		prowJobs[bqjr.BuildID] = prow.ProwJob{
 			Spec: prow.ProwJobSpec{
 				Type:    bqjr.Type,
@@ -121,6 +144,7 @@ func (pl *ProwLoader) fetchProwJobsFromOpenShiftBigQuery() ([]prow.ProwJob, []er
 				URL:            bqjr.URL,
 				BuildID:        bqjr.BuildID,
 			},
+			Annotations: filteredAnnotations,
 		}
 		count++
 	}
@@ -151,4 +175,5 @@ type bigqueryProwJobRun struct {
 	PROrg          bigquery.NullString    `bigquery:"org"`
 	PRRepo         bigquery.NullString    `bigquery:"repo"`
 	GCSBucket      bigquery.NullString    `bigquery:"gcs_bucket"`
+	Annotations    []string               `bigquery:"prowjob_annotations"`
 }

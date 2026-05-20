@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"net/http"
+	"os"
+	"slices"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -14,14 +17,19 @@ import (
 	"github.com/spf13/pflag"
 
 	resources "github.com/openshift/sippy"
+	"github.com/openshift/sippy/pkg/api/componentreadiness/dataprovider"
+	bqprovider "github.com/openshift/sippy/pkg/api/componentreadiness/dataprovider/bigquery"
+	pgprovider "github.com/openshift/sippy/pkg/api/componentreadiness/dataprovider/postgres"
 	"github.com/openshift/sippy/pkg/apis/cache"
 	"github.com/openshift/sippy/pkg/bigquery"
+	"github.com/openshift/sippy/pkg/bigquery/bqlabel"
 	"github.com/openshift/sippy/pkg/dataloader/prowloader/gcs"
 	"github.com/openshift/sippy/pkg/db/models"
 	"github.com/openshift/sippy/pkg/flags"
 	"github.com/openshift/sippy/pkg/flags/configflags"
 	"github.com/openshift/sippy/pkg/sippyserver"
 	"github.com/openshift/sippy/pkg/sippyserver/metrics"
+	"github.com/openshift/sippy/pkg/testidentification"
 	"github.com/openshift/sippy/pkg/util"
 )
 
@@ -35,6 +43,7 @@ type ServerFlags struct {
 	ConfigFlags             *configflags.ConfigFlags
 	APIFlags                *flags.APIFlags
 	JiraFlags               *flags.JiraFlags
+	DataProvider            string
 }
 
 func NewServerFlags() *ServerFlags {
@@ -61,9 +70,13 @@ func (f *ServerFlags) BindFlags(flagSet *pflag.FlagSet) {
 	f.ConfigFlags.BindFlags(flagSet)
 	f.APIFlags.BindFlags(flagSet)
 	f.JiraFlags.BindFlags(flagSet)
+	flagSet.StringVar(&f.DataProvider, "data-provider", "bigquery", "Data provider for component readiness: bigquery, postgres")
 }
 
 func (f *ServerFlags) Validate() error {
+	if f.DataProvider == "postgres" {
+		return nil
+	}
 	return f.GoogleCloudFlags.Validate()
 }
 
@@ -95,27 +108,51 @@ func NewServeCommand() *cobra.Command {
 
 			var bigQueryClient *bigquery.Client
 			var gcsClient *storage.Client
-			if f.GoogleCloudFlags.ServiceAccountCredentialFile != "" {
-				bigQueryClient, err = f.BigQueryFlags.GetBigQueryClient(context.Background(),
-					cacheClient, f.GoogleCloudFlags.ServiceAccountCredentialFile)
-				if err != nil {
-					return errors.WithMessage(err, "couldn't get bigquery client")
+			var crDataProvider dataprovider.DataProvider
+			switch f.DataProvider {
+			case "bigquery":
+				if f.GoogleCloudFlags.ServiceAccountCredentialFile != "" {
+					opCtx := bqlabel.OperationalContext{
+						App:     bqlabel.AppSippy,
+						Command: "serve",
+						// outside prod, defaults to CLI as env and USER env var as operator
+						Environment: bqlabel.EnvCli,
+						Operator:    os.Getenv("USER"),
+					}
+					env := bqlabel.EnvValue(os.Getenv("SIPPY_WEB_ENV")) // set in prod
+					if slices.Contains([]bqlabel.EnvValue{bqlabel.EnvWeb, bqlabel.EnvWebAuth, bqlabel.EnvWebQE}, env) {
+						opCtx.Environment = env
+						opCtx.Operator = string(env)
+					}
+					bigQueryClient, err = f.BigQueryFlags.GetBigQueryClient(context.Background(), opCtx, cacheClient, f.GoogleCloudFlags.ServiceAccountCredentialFile)
+					if err != nil {
+						return errors.WithMessage(err, "couldn't get bigquery client")
+					}
+
+					if bigQueryClient != nil && f.CacheFlags.EnablePersistentCaching {
+						bigQueryClient = f.CacheFlags.DecorateBiqQueryClientWithPersistentCache(bigQueryClient)
+					}
+
+					crDataProvider = bqprovider.NewBigQueryProvider(bigQueryClient, config.ComponentReadinessConfig.VariantJunitTableOverrides)
 				}
 
-				if bigQueryClient != nil && f.CacheFlags.EnablePersistentCaching {
-					bigQueryClient = f.CacheFlags.DecorateBiqQueryClientWithPersistentCache(bigQueryClient)
-				}
+			case "postgres":
+				crDataProvider = pgprovider.NewPostgresProvider(dbc, cacheClient)
+				log.Info("Using Postgres data provider for component readiness")
 
-				gcsClient, err = gcs.NewGCSClient(context.TODO(),
-					f.GoogleCloudFlags.ServiceAccountCredentialFile,
-					f.GoogleCloudFlags.OAuthClientCredentialFile,
-				)
-				if err != nil {
-					log.WithError(err).Warn("unable to create GCS client, some APIs may not work")
-				}
+			default:
+				return fmt.Errorf("unknown --data-provider %q, must be bigquery or postgres", f.DataProvider)
 			}
 
-			// Make sure the db is intialized, otherwise let the user know:
+			gcsClient, err = gcs.NewGCSClient(context.TODO(),
+				f.GoogleCloudFlags.ServiceAccountCredentialFile,
+				f.GoogleCloudFlags.OAuthClientCredentialFile,
+			)
+			if err != nil {
+				log.WithError(err).Warn("unable to create GCS client, some APIs may not work")
+			}
+
+			// Make sure the db is initialized, otherwise let the user know:
 			prowJobs := []models.ProwJob{}
 			res := dbc.DB.Find(&prowJobs).Limit(1)
 			if res.Error != nil {
@@ -129,11 +166,13 @@ func NewServeCommand() *cobra.Command {
 
 			pinnedDateTime := f.DBFlags.GetPinnedTime()
 
-			variantManager := f.ModeFlags.GetVariantManager(context.Background(), bigQueryClient)
+			var variantManager testidentification.VariantManager
+			if bigQueryClient != nil {
+				variantManager = f.ModeFlags.GetVariantManager(context.Background(), bigQueryClient)
+			}
 			views, err := f.ComponentReadinessFlags.ParseViewsFile()
 			if err != nil {
 				log.WithError(err).Fatal("unable to load views")
-
 			}
 
 			jiraClient, err := f.JiraFlags.GetJiraClient()
@@ -153,6 +192,7 @@ func NewServeCommand() *cobra.Command {
 				gcsClient,
 				f.GoogleCloudFlags.StorageBucket,
 				bigQueryClient,
+				crDataProvider,
 				pinnedDateTime,
 				cacheClient,
 				f.ComponentReadinessFlags.CRTimeRoundingFactor,
@@ -169,10 +209,10 @@ func NewServeCommand() *cobra.Command {
 					context.Background(),
 					dbc,
 					bigQueryClient,
+					crDataProvider,
 					util.GetReportEnd(pinnedDateTime),
-					cache.RequestOptions{CRTimeRoundingFactor: f.ComponentReadinessFlags.CRTimeRoundingFactor},
-					views.ComponentReadiness,
-					config.ComponentReadinessConfig.VariantJunitTableOverrides)
+					cache.NewStandardCROptions(f.ComponentReadinessFlags.CRTimeRoundingFactor),
+					views.ComponentReadiness)
 				if err != nil {
 					log.WithError(err).Error("error refreshing metrics")
 				}
@@ -189,10 +229,10 @@ func NewServeCommand() *cobra.Command {
 								context.Background(),
 								dbc,
 								bigQueryClient,
+								crDataProvider,
 								util.GetReportEnd(pinnedDateTime),
-								cache.RequestOptions{CRTimeRoundingFactor: f.ComponentReadinessFlags.CRTimeRoundingFactor},
-								views.ComponentReadiness,
-								config.ComponentReadinessConfig.VariantJunitTableOverrides)
+								cache.NewStandardCROptions(f.ComponentReadinessFlags.CRTimeRoundingFactor),
+								views.ComponentReadiness)
 							if err != nil {
 								log.WithError(err).Error("error refreshing metrics")
 							}

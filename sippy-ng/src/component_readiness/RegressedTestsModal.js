@@ -1,4 +1,5 @@
 import { Box, Button, Grid, Tab, Tabs, Typography } from '@mui/material'
+import { CompReadyVarsContext } from './CompReadyVars'
 import {
   NumberParam,
   StringParam,
@@ -7,7 +8,7 @@ import {
 } from 'use-query-params'
 import Dialog from '@mui/material/Dialog'
 import PropTypes from 'prop-types'
-import React, { Fragment } from 'react'
+import React, { Fragment, useContext } from 'react'
 import RegressedTestsPanel from './RegressedTestsPanel'
 import TriagedTestsPanel from './TriagedTestsPanel'
 
@@ -52,6 +53,7 @@ export default function RegressedTestsModal({
   isOpen,
   close,
 }) {
+  const { view } = useContext(CompReadyVarsContext)
   const [activeTab = 0, setActiveTab] = useQueryParam(
     'regressedModalTab',
     NumberParam,
@@ -63,13 +65,16 @@ export default function RegressedTestsModal({
       regressedModalPage: NumberParam,
       regressedModalTestRow: NumberParam,
       regressedModalTestPage: NumberParam,
+      regressedModalFilters: StringParam,
+      regressedModalTestFilters: StringParam,
+      triageFilters: StringParam,
     },
     { updateType: 'replaceIn' }
   )
 
   const handleTabChange = (event, newValue) => {
     setActiveTab(newValue)
-    // The active pages and rows in the DataGrid are most likely no longer relevant when switching tabs
+    // Reset pagination and selection when switching tabs, but keep filters
     setQuery(
       {
         regressedModalRow: undefined,
@@ -126,7 +131,7 @@ export default function RegressedTestsModal({
           )}
           <RegressedTestsTabPanel activeIndex={activeTab} index={3}>
             <RegressedTestsPanel
-              regressedTests={allRegressedTests}
+              regressedTests={allRegressedTests?.[view] || []}
               setTriageActionTaken={setTriageActionTaken}
               filterVals={filterVals}
             />
@@ -147,7 +152,7 @@ export default function RegressedTestsModal({
 
 RegressedTestsModal.propTypes = {
   regressedTests: PropTypes.array,
-  allRegressedTests: PropTypes.array,
+  allRegressedTests: PropTypes.object,
   unresolvedTests: PropTypes.array,
   triageEntries: PropTypes.array,
   setTriageActionTaken: PropTypes.func,

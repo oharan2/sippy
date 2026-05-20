@@ -1,14 +1,16 @@
+import { applyFilterModel } from '../datagrid/filterUtils'
 import { CompReadyVarsContext } from './CompReadyVars'
-import { DataGrid, GridToolbar } from '@mui/x-data-grid'
+import { DataGrid } from '@mui/x-data-grid'
 import { FileCopy } from '@mui/icons-material'
 import { formColumnName, generateTestDetailsReportLink } from './CompReadyUtils'
 import { NumberParam, StringParam, useQueryParam } from 'use-query-params'
 import { Popover, Snackbar, Tooltip } from '@mui/material'
-import { relativeTime } from '../helpers'
+import { relativeTime, SafeJSONParam } from '../helpers'
 import { SippyCapabilitiesContext } from '../App'
 import Alert from '@mui/material/Alert'
 import Button from '@mui/material/Button'
 import CompSeverityIcon from './CompSeverityIcon'
+import GridToolbar from '../datagrid/GridToolbar'
 import IconButton from '@mui/material/IconButton'
 import PropTypes from 'prop-types'
 import React, { Fragment, useContext } from 'react'
@@ -25,11 +27,50 @@ export default function RegressedTestsPanel(props) {
     NumberParam,
     { updateType: 'replaceIn' }
   )
+  const [filterModel = { items: [] }, setFilterModel] = useQueryParam(
+    'regressedModalFilters',
+    SafeJSONParam,
+    { updateType: 'replaceIn' }
+  )
   const { expandEnvironment, views, view } = useContext(CompReadyVarsContext)
   const { filterVals, regressedTests, setTriageActionTaken } = props
   const [sortModel, setSortModel] = React.useState([
     { field: 'component', sort: 'asc' },
   ])
+
+  const addFilters = (filter) => {
+    const currentFilters = filterModel.items.filter((item) => item.value !== '')
+
+    filter.forEach((item) => {
+      if (item.value && item.value !== '') {
+        currentFilters.push(item)
+      }
+    })
+    setFilterModel({
+      items: currentFilters,
+      linkOperator: filterModel.linkOperator || 'and',
+    })
+  }
+
+  // Quick search functionality - searches test_name field
+  const requestSearch = (searchValue) => {
+    // Filter out empty items and existing test_name filters
+    const currentFilters = filterModel.items.filter(
+      (f) => f.value !== '' && f.columnField !== 'test_name'
+    )
+    if (searchValue && searchValue !== '') {
+      currentFilters.push({
+        id: 99,
+        columnField: 'test_name',
+        operatorValue: 'contains',
+        value: searchValue,
+      })
+    }
+    setFilterModel({
+      items: currentFilters,
+      linkOperator: filterModel.linkOperator || 'and',
+    })
+  }
 
   // Helpers for copying the test ID to clipboard
   const [copyPopoverEl, setCopyPopoverEl] = React.useState(null)
@@ -44,11 +85,6 @@ export default function RegressedTestsPanel(props) {
   // Helpers to create triage entries
   const capabilitiesContext = React.useContext(SippyCapabilitiesContext)
   const triageEnabled = capabilitiesContext.includes('write_endpoints')
-
-  const currentView = views.find((v) => v.name === view)
-  const regressionTrackingEnabled =
-    currentView?.regression_tracking?.enabled || false
-  const triageButtonEnabled = triageEnabled && regressionTrackingEnabled
 
   const [triaging, setTriaging] = React.useState(false)
   const [regressionIds, setRegressionIds] = React.useState([])
@@ -86,6 +122,7 @@ export default function RegressedTestsPanel(props) {
             field: 'triage',
             headerName: 'Triage',
             flex: 4,
+            filterable: false,
             valueGetter: (params) => {
               if (!params.row.regression?.opened) {
                 // For a regression we haven't yet detected:
@@ -110,24 +147,28 @@ export default function RegressedTestsPanel(props) {
       field: 'component',
       headerName: 'Component',
       flex: 20,
+      autocomplete: 'component',
       renderCell: (param) => <div className="test-name">{param.value}</div>,
     },
     {
       field: 'capability',
       headerName: 'Capability',
       flex: 12,
+      autocomplete: 'capability',
       renderCell: (param) => <div className="test-name">{param.value}</div>,
     },
     {
       field: 'test_name',
       headerName: 'Test Name',
       flex: 40,
+      autocomplete: 'test_name',
       renderCell: (param) => <div className="test-name">{param.value}</div>,
     },
     {
       field: 'test_suite',
       headerName: 'Test Suite',
       flex: 15,
+      autocomplete: 'test_suite',
       renderCell: (param) => <div className="test-name">{param.value}</div>,
     },
     {
@@ -137,12 +178,35 @@ export default function RegressedTestsPanel(props) {
       valueGetter: (params) => {
         return formColumnName({ variants: params.row.variants })
       },
-      renderCell: (param) => <div className="test-name">{param.value}</div>,
+      renderCell: (params) => {
+        const variants = params.row.variants
+        const tooltipLines = Object.keys(variants)
+          .sort()
+          .map((key) => `${key}:${variants[key]}`)
+          .join('\n')
+        const briefDisplay = Object.keys(variants)
+          .sort()
+          .map((key) => variants[key])
+          // for brevity, there's little point showing bare default/none/unknown strings and the UI gets much
+          // cleaner without them. full key/values are always available in the hover tooltip.
+          .filter((val) => !['default', 'none', 'unknown'].includes(val))
+          .join(' ')
+        return (
+          <Tooltip
+            title={
+              <span style={{ whiteSpace: 'pre-line' }}>{tooltipLines}</span>
+            }
+          >
+            <div className="test-name">{briefDisplay}</div>
+          </Tooltip>
+        )
+      },
     },
     {
       field: 'regression',
       headerName: 'Regressed Since',
       flex: 12,
+      filterable: false,
       valueGetter: (params) => {
         if (!params.row.regression?.opened) {
           // For a regression we haven't yet detected:
@@ -172,6 +236,7 @@ export default function RegressedTestsPanel(props) {
       field: 'last_failure',
       headerName: 'Last Failure',
       flex: 12,
+      filterable: false,
       valueGetter: (params) => {
         if (!params.row.last_failure) {
           return null
@@ -192,6 +257,7 @@ export default function RegressedTestsPanel(props) {
       field: 'test_id',
       flex: 5,
       headerName: 'ID',
+      filterable: false,
       renderCell: (params) => {
         return (
           <IconButton
@@ -211,6 +277,7 @@ export default function RegressedTestsPanel(props) {
     {
       field: 'status',
       headerName: 'Status',
+      filterable: false,
       renderCell: (params) => (
         <div
           style={{
@@ -242,6 +309,12 @@ export default function RegressedTestsPanel(props) {
     },
   ]
 
+  // Apply client-side filtering using shared utility
+  const filteredTests = React.useMemo(
+    () => applyFilterModel(regressedTests, filterModel, columns),
+    [regressedTests, filterModel, columns]
+  )
+
   return (
     <Fragment>
       <Snackbar
@@ -258,7 +331,7 @@ export default function RegressedTestsPanel(props) {
         sortModel={sortModel}
         onSortModelChange={setSortModel}
         components={{ Toolbar: GridToolbar }}
-        rows={regressedTests}
+        rows={filteredTests}
         columns={columns}
         getRowId={(row) =>
           row.test_id +
@@ -285,7 +358,16 @@ export default function RegressedTestsPanel(props) {
         componentsProps={{
           toolbar: {
             columns: columns,
-            showQuickFilter: true,
+            addFilters: addFilters,
+            filterModel: filterModel,
+            setFilterModel: setFilterModel,
+            clearSearch: () => requestSearch(''),
+            doSearch: requestSearch,
+            autocompleteData: regressedTests,
+            downloadDataFunc: () => {
+              return filteredTests
+            },
+            downloadFilePrefix: 'regressed_tests',
           },
         }}
       />
@@ -298,25 +380,14 @@ export default function RegressedTestsPanel(props) {
         />
       )}
       {triageEnabled ? (
-        <Tooltip
-          title={
-            !regressionTrackingEnabled
-              ? 'Triage is not available because regression tracking is not enabled for this view'
-              : ''
-          }
+        <Button
+          variant="contained"
+          color="secondary"
+          sx={'margin: 10px'}
+          onClick={() => setTriaging(!triaging)}
         >
-          <span>
-            <Button
-              variant="contained"
-              color="secondary"
-              sx={'margin: 10px'}
-              onClick={() => setTriaging(!triaging)}
-              disabled={!triageButtonEnabled}
-            >
-              {triaging ? 'Cancel' : 'Triage'}
-            </Button>
-          </span>
-        </Tooltip>
+          {triaging ? 'Cancel' : 'Triage'}
+        </Button>
       ) : null}
 
       <Popover

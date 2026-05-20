@@ -26,25 +26,35 @@ var wordRegexp = regexp.MustCompile(`^\w+$`)
 var uintRegexp = regexp.MustCompile(`^\d+$`)
 var nameRegexp = regexp.MustCompile(`^[-.\w]+$`)
 var releaseRegexp = regexp.MustCompile(`^\d+\.\d+$`)
+var dateRegexp = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
 var nonEmptyRegex = regexp.MustCompile(`^.+$`)
+var boolRegexp = regexp.MustCompile(`^(true|false)$`)
 var paramRegexp = map[string]*regexp.Regexp{
 	// sippy classic params
-	"release":         regexp.MustCompile(`^[\w.-]+$`), // usually 4.x or Presubmit, but allow any "word"
-	"period":          wordRegexp,
-	"stream":          wordRegexp,
-	"arch":            wordRegexp,
-	"payload":         nameRegexp,
-	"fromPayload":     nameRegexp,
-	"toPayload":       nameRegexp,
-	"job":             nameRegexp,
-	"job_name":        nameRegexp,
-	"test":            regexp.MustCompile(`^.+$`), // tests can be anything, so always parameterize in sql
-	"prow_job_run_id": uintRegexp,
-	"file":            nameRegexp,
-	"repo_info":       nameRegexp,
-	"pull_number":     uintRegexp,
-	"sort":            wordRegexp,
-	"sortField":       wordRegexp,
+	"release":          regexp.MustCompile(`^[\w.-]+$`), // usually 4.x or Presubmit, but allow any "word"
+	"period":           wordRegexp,
+	"stream":           wordRegexp,
+	"arch":             wordRegexp,
+	"payload":          nameRegexp,
+	"fromPayload":      nameRegexp,
+	"toPayload":        nameRegexp,
+	"job":              nameRegexp,
+	"job_name":         nameRegexp,
+	"test":             regexp.MustCompile(`^.+$`),        // tests can be anything, so always parameterize in sql
+	"test_id":          regexp.MustCompile(`^[\w:. -]+$`), // test IDs like "openshift-tests-upgrade:af8a62c596e5c2b5448a5d308f4989a6" or "cluster install:0cb1bb27e418491b1ffdacab58c5c8c0"
+	"prow_job_run_id":  uintRegexp,
+	"prow_job_run_ids": regexp.MustCompile(`^\d+(,\d+)*$`), // comma-separated integers
+	"org":              nameRegexp,
+	"repo":             nameRegexp,
+	"pr_number":        uintRegexp,
+	"file":             nameRegexp,
+	"repo_info":        nameRegexp,
+	"pull_number":      uintRegexp,
+	"sort":             wordRegexp,
+	"sortField":        wordRegexp,
+	"start_date":       dateRegexp, // YYYY-MM-DD format
+	"end_date":         dateRegexp, // YYYY-MM-DD format
+	"include_success":  boolRegexp, // true or false
 	// component readiness params
 	"baseRelease":      releaseRegexp,
 	"sampleRelease":    releaseRegexp,
@@ -63,6 +73,9 @@ var paramRegexp = map[string]*regexp.Regexp{
 	"maxFileMatches":     uintRegexp,
 	"beforeContext":      uintRegexp,
 	"afterContext":       uintRegexp,
+	// recent test failures params
+	"previousPeriod": wordRegexp,
+	"includeOutputs": boolRegexp,
 }
 
 // SafeRead returns the value of a query parameter only if it matches the given regexp.
@@ -109,4 +122,23 @@ func ReadUint(req *http.Request, name string, limit int) (int, error) {
 		return 0, err
 	}
 	return intValue, nil
+}
+
+// ReadBool returns the boolean value of a query parameter.
+// Accepts "true" or "false" (case-sensitive).
+// If the param is not present or empty, it returns the provided default value and nil.
+// If the value is invalid, it returns false and an error.
+func ReadBool(req *http.Request, name string, defaultValue bool) (bool, error) {
+	value := req.URL.Query().Get(name)
+	if value == "" {
+		return defaultValue, nil
+	}
+
+	if !boolRegexp.MatchString(value) {
+		err := fmt.Errorf("invalid value for %q param: %q (expected true or false)", name, value)
+		log.Warn(err)
+		return false, err
+	}
+
+	return value == "true", nil
 }

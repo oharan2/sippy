@@ -48,6 +48,9 @@ type Triage struct {
 	// If we could establish this, it may mean less data duplication.
 	Regressions []TestRegression `json:"regressions" gorm:"constraint:OnDelete:CASCADE;many2many:triage_regressions;"`
 
+	// TriageSymptoms links symptoms discovered in regression job runs to this triage.
+	TriageSymptoms []TriageSymptom `json:"-" gorm:"foreignKey:TriageID;constraint:OnDelete:CASCADE"`
+
 	// Resolution is an important field presently set by a user indicating a claimed time this issue was resolved,
 	// and thus all associated regressions should be fixed.
 	// Setting this will immediately change the regressions icon to one indicate the issue is believed to
@@ -206,19 +209,19 @@ func ValidTriageType(triageType TriageType) bool {
 // regressions opening and closing.
 type TestRegression struct {
 	ID      uint   `json:"id" gorm:"primaryKey,column:id"`
-	View    string `json:"view" gorm:"not null"`
 	Release string `json:"release" gorm:"not null;index:idx_test_regression_release"`
 	// BaseRelease is the release this test was marked regressed against. It may not match the view's base release
 	// if the view uses release fallback and this test was flagged regressed against a prior release with better pass rate.
-	BaseRelease string         `json:"base_release"`
-	Component   string         `json:"component"`
-	Capability  string         `json:"capability"`
-	TestID      string         `json:"test_id" gorm:"not null"`
-	TestName    string         `json:"test_name" gorm:"not null;index:idx_test_regression_test_name"`
-	Variants    pq.StringArray `json:"variants" gorm:"not null;type:text[]"`
-	Opened      time.Time      `json:"opened" gorm:"not null"`
-	Closed      sql.NullTime   `json:"closed"`
-	Triages     []Triage       `json:"triages" gorm:"many2many:triage_regressions;"`
+	BaseRelease  string         `json:"base_release"`
+	Component    string         `json:"component"`
+	Capability   string         `json:"capability"`
+	CrossCompare bool           `json:"cross_compare" gorm:"not null;default:false"`
+	TestID       string         `json:"test_id" gorm:"not null"`
+	TestName     string         `json:"test_name" gorm:"not null;index:idx_test_regression_test_name"`
+	Variants     pq.StringArray `json:"variants" gorm:"not null;type:text[]"`
+	Opened       time.Time      `json:"opened" gorm:"not null"`
+	Closed       sql.NullTime   `json:"closed"`
+	Triages      []Triage       `json:"triages" gorm:"many2many:triage_regressions;"`
 	// LastFailure is the last failure in the sample we saw while this regression was open.
 	LastFailure sql.NullTime `json:"last_failure"`
 	// MaxFailures is the maximum number of failures we found in the reporting window while this regression was open.
@@ -226,6 +229,48 @@ type TestRegression struct {
 	// disappear on their own.
 	MaxFailures int `json:"max_failures"`
 
+	// JobRuns accumulates the unique set of all job runs ever observed while this regression was open.
+	// As the 7-day sample window slides, old runs roll off and new ones appear, but this list retains all of them.
+	JobRuns []RegressionJobRun `json:"job_runs,omitempty" gorm:"foreignKey:RegressionID;constraint:OnDelete:CASCADE;"`
+
+	// Views tracks which component readiness views this regression has been observed in.
+	Views []RegressionView `json:"views,omitempty" gorm:"foreignKey:TestRegressionID;constraint:OnDelete:CASCADE;"`
+
 	// Links contains HATEOAS-style links for this regression record (not stored in database)
 	Links map[string]string `json:"links,omitempty" gorm:"-"`
+}
+
+// RegressionView associates a regression with a component readiness view.
+// The Active flag tracks whether the regression currently appears in the view's component report.
+type RegressionView struct {
+	TestRegressionID uint         `json:"test_regression_id" gorm:"primaryKey"`
+	ViewName         string       `json:"view_name" gorm:"primaryKey"`
+	Active           bool         `json:"active" gorm:"not null;default:true"`
+	OpenedAt         time.Time    `json:"opened_at" gorm:"not null;default:now()"`
+	ClosedAt         sql.NullTime `json:"closed_at"`
+}
+
+// RegressionJobRun represents a single job run observed during the lifetime of a regression.
+// It stores data from BigQuery so we don't depend on the job existing in PostgreSQL's prow_job_runs table.
+type RegressionJobRun struct {
+	ID           uint           `json:"id" gorm:"primaryKey"`
+	RegressionID uint           `json:"regression_id" gorm:"column:regression_id;not null;uniqueIndex:idx_regression_job_run"`
+	ProwJobRunID string         `json:"prowjob_run_id" gorm:"column:prow_job_run_id;not null;uniqueIndex:idx_regression_job_run"`
+	ProwJobName  string         `json:"prowjob_name" gorm:"column:prow_job_name;not null"`
+	ProwJobURL   string         `json:"prowjob_url" gorm:"column:prow_job_url"`
+	StartTime    time.Time      `json:"start_time" gorm:"column:start_time"`
+	TestFailed   bool           `json:"test_failed" gorm:"column:test_failed"`
+	TestFailures int            `json:"test_failures" gorm:"column:test_failures"`
+	JobLabels    pq.StringArray `json:"job_labels,omitempty" gorm:"column:job_labels;type:text[]"`
+	JobSymptoms  pq.StringArray `json:"job_symptoms,omitempty" gorm:"column:job_symptoms;type:text[]"`
+}
+
+// TriageSymptom records that a specific symptom was found on a specific regression
+// belonging to a triage. JobRunCount tracks how many failed job runs on that
+// regression exhibited the symptom.
+type TriageSymptom struct {
+	TriageID     uint   `json:"triage_id" gorm:"primaryKey;column:triage_id"`
+	SymptomID    string `json:"symptom_id" gorm:"primaryKey;column:symptom_id"`
+	RegressionID uint   `json:"regression_id" gorm:"primaryKey;column:regression_id"`
+	JobRunCount  int    `json:"job_run_count" gorm:"column:job_run_count;not null;default:0"`
 }

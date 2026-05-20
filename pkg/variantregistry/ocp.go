@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,41 +14,52 @@ import (
 	"cloud.google.com/go/bigquery"
 	"cloud.google.com/go/storage"
 	"github.com/hashicorp/go-version"
+	"github.com/openshift/sippy/pkg/bigquery/bqlabel"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/api/iterator"
+	"k8s.io/apimachinery/pkg/util/sets"
 
+	"github.com/openshift/sippy/pkg/apis/api/componentreport/crview"
 	v1 "github.com/openshift/sippy/pkg/apis/config/v1"
 	"github.com/openshift/sippy/pkg/dataloader/prowloader"
 	"github.com/openshift/sippy/pkg/dataloader/prowloader/gcs"
+	"github.com/openshift/sippy/pkg/releaseoverride"
 	"github.com/openshift/sippy/pkg/util"
 )
 
 // OCPVariantLoader generates a mapping of job names to their variant map for all known jobs.
 type OCPVariantLoader struct {
-	BigQueryClient  *bigquery.Client
-	config          *v1.SippyConfig
-	bigQueryProject string
-	bigQueryDataSet string
-	bigQueryTable   string
-	gcsClient       *storage.Client
+	BigQueryClient               *bigquery.Client
+	bqOpContext                  bqlabel.OperationalContext
+	config                       *v1.SippyConfig
+	views                        []crview.View
+	syntheticReleaseJobOverrides *releaseoverride.SyntheticReleaseOverrides
+	bigQueryProject              string
+	bigQueryDataSet              string
+	bigQueryTable                string
+	gcsClient                    *storage.Client
 }
 
 func NewOCPVariantLoader(
 	bigQueryClient *bigquery.Client,
-	bigQueryProject string,
-	bigQueryDataSet string,
-	bigQueryTable string,
+	opCtx bqlabel.OperationalContext,
+	bigQueryProject, bigQueryDataSet, bigQueryTable string,
 	gcsClient *storage.Client,
-	config *v1.SippyConfig) *OCPVariantLoader {
-
+	config *v1.SippyConfig,
+	views []crview.View,
+	syntheticReleaseJobOverrides *releaseoverride.SyntheticReleaseOverrides,
+) *OCPVariantLoader {
 	return &OCPVariantLoader{
-		BigQueryClient:  bigQueryClient,
-		gcsClient:       gcsClient,
-		config:          config,
-		bigQueryProject: bigQueryProject,
-		bigQueryDataSet: bigQueryDataSet,
-		bigQueryTable:   bigQueryTable,
+		BigQueryClient:               bigQueryClient,
+		bqOpContext:                  opCtx,
+		gcsClient:                    gcsClient,
+		config:                       config,
+		views:                        views,
+		syntheticReleaseJobOverrides: syntheticReleaseJobOverrides,
+		bigQueryProject:              bigQueryProject,
+		bigQueryDataSet:              bigQueryDataSet,
+		bigQueryTable:                bigQueryTable,
 	}
 }
 
@@ -56,6 +68,14 @@ type prowJobLastRun struct {
 	JobRunID  string              `bigquery:"prowjob_build_id"`
 	GCSBucket bigquery.NullString `bigquery:"gcs_bucket"`
 	URL       bigquery.NullString `bigquery:"prowjob_url"`
+}
+
+// applyQueryLabels applies query labels manually since this loader does not use the client that would do it for us.
+func (v *OCPVariantLoader) applyQueryLabels(queryLabel bqlabel.QueryValue, q *bigquery.Query) {
+	bqlabel.Context{
+		OperationalContext: v.bqOpContext,
+		RequestContext:     bqlabel.RequestContext{Query: queryLabel},
+	}.ApplyLabels(q)
 }
 
 // LoadExpectedJobVariants queries all known jobs from the gce-devel "jobs" table (actually contains job runs).
@@ -86,6 +106,7 @@ WITH RecentSuccessfulJobs AS (
           OR prowjob_job_name LIKE 'release-%%'
           OR prowjob_job_name LIKE 'aggregator-%%'
           OR prowjob_job_name LIKE 'periodic-ci-%%-lp-interop-%%'
+          OR prowjob_job_name LIKE 'periodic-ci-%%-quay-cr-%%'
           OR prowjob_job_name LIKE 'pull-ci-openshift-%%')
   GROUP BY prowjob_job_name
 )
@@ -106,6 +127,7 @@ WHERE j.prowjob_start > DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 180 DAY) AND
         OR j.prowjob_job_name LIKE 'periodic-ci-Azure-ARO-HCP-%%'
         OR j.prowjob_job_name LIKE 'release-%%'
         OR j.prowjob_job_name LIKE 'periodic-ci-%%-lp-interop-%%'
+        OR j.prowjob_job_name LIKE 'periodic-ci-%%-quay-cr-%%'
         OR j.prowjob_job_name LIKE 'aggregator-%%')
       OR j.prowjob_job_name LIKE 'pull-ci-openshift-%%')
 GROUP BY j.prowjob_job_name, r.prowjob_url, r.successful_start
@@ -116,7 +138,8 @@ ORDER BY j.prowjob_job_name;
 	log.Infof("running query for recent jobs: \n%s", queryStr)
 
 	query := v.BigQueryClient.Query(queryStr)
-	it, err := query.Read(context.TODO())
+	v.applyQueryLabels(bqlabel.VariantRegistryLoadExpectedVariants, query)
+	it, err := query.Read(ctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "error querying primary list of all jobs")
 	}
@@ -300,10 +323,20 @@ func (v *OCPVariantLoader) CalculateVariantsForJob(jLog logrus.FieldLogger, jobN
 			case VariantNetworkStack:
 				// Discovered in https://issues.redhat.com/browse/TRT-1777
 				// 4.13+ gained cluster-data.json but it was not able to detect dualstack, so
-				// jobs in this range were categorized as ipv4 mistakenly. Once fixed, we'll
-				// want this to become conditional on release, i.e. use job name network stack
-				// if release <= 4.18 (assuming this is where it gets fixed)
-				jLog.Infof("variant mismatch: using %s from job name", k)
+				// jobs in this range were categorized as ipv4 mistakenly.
+				// For 4.21+, cluster-data.json network stack detection is reliable, so use it.
+				releaseVersion := releaseVersionFromVariants(jLog, variants)
+				releaseLabel := "unknown"
+				if releaseVersion != nil {
+					releaseLabel = releaseVersion.String()
+				}
+				clusterDataReliable, _ := version.NewVersion("4.21")
+				if releaseVersion != nil && releaseVersion.GreaterThanOrEqual(clusterDataReliable) {
+					jLog.Infof("variant mismatch: using %s from cluster-data (release %s >= 4.21)", k, releaseLabel)
+					variants[k] = v
+				} else {
+					jLog.Infof("variant mismatch: using %s from job name (release %s < 4.21)", k, releaseLabel)
+				}
 				continue
 			default:
 				jLog.Infof("variant mismatch: using %s from job run variants file", k)
@@ -312,11 +345,77 @@ func (v *OCPVariantLoader) CalculateVariantsForJob(jLog logrus.FieldLogger, jobN
 		}
 	}
 
+	v.adjustJobTierBasedOnView(jLog, jobName, variants)
+
 	return variants
 }
 
+// adjustJobTierBasedOnView checks if a job with a component readiness tier (blocking/standard/informing)
+// has variant values that are filtered out by the release-main view. If so, it downgrades the tier
+// to candidate since the job would not appear in component readiness anyway.
+func (v *OCPVariantLoader) adjustJobTierBasedOnView(jLog logrus.FieldLogger, jobName string, variants map[string]string) {
+	release := variants[VariantRelease]
+	if release == "" {
+		return
+	}
+
+	viewName := release + "-main"
+	var view *crview.View
+	for i := range v.views {
+		if v.views[i].Name == viewName {
+			view = &v.views[i]
+			break
+		}
+	}
+	if view == nil {
+		return
+	}
+
+	// Check if the job's tier is one that is included in the view. If the view
+	// doesn't specify JobTier at all, all tiers are included and we skip adjustment.
+	// If the tier is already not included (e.g. candidate, hidden), no point adjusting.
+	tier := variants[VariantJobTier]
+	allowedTiers := view.VariantOptions.IncludeVariants[VariantJobTier]
+	if len(allowedTiers) == 0 {
+		return
+	}
+	tierIncluded := false
+	for _, at := range allowedTiers {
+		if at == tier {
+			tierIncluded = true
+			break
+		}
+	}
+	if !tierIncluded {
+		return
+	}
+
+	for variantName, allowedValues := range view.VariantOptions.IncludeVariants {
+		if len(allowedValues) == 0 {
+			continue
+		}
+		jobValue, ok := variants[variantName]
+		if !ok {
+			continue
+		}
+		found := false
+		for _, av := range allowedValues {
+			if av == jobValue {
+				found = true
+				break
+			}
+		}
+		if !found {
+			jLog.Warnf("job %s has %s tier but variant %s=%s is not included in view %s (allowed: %v), adjusting to candidate",
+				jobName, tier, variantName, jobValue, viewName, allowedValues)
+			variants[VariantJobTier] = "candidate"
+			return
+		}
+	}
+}
+
 var (
-	upgradeMinorRegex       = regexp.MustCompile(`(?i)(-\d+\.\d+-.*-.*-\d+\.\d+)|(-\d+\.\d+-minor)`)
+	upgradeMajorMinorRegex  = regexp.MustCompile(`(?i)(-\d+\.\d+-.*-.*-\d+\.\d+)|(-\d+\.\d+-(minor|major))`)
 	upgradeOutOfChangeRegex = regexp.MustCompile(`(?i)-upgrade-out-of-change`)
 	upgradeRegex            = regexp.MustCompile(`(?i)-upgrade`)
 
@@ -569,7 +668,7 @@ func setNetworkStack(_ logrus.FieldLogger, variants map[string]string, jobName s
 	variants[VariantNetworkStack] = "ipv4"
 }
 
-func (v *OCPVariantLoader) setRelease(_ logrus.FieldLogger, variants map[string]string, jobName string) {
+func (v *OCPVariantLoader) setRelease(logger logrus.FieldLogger, variants map[string]string, jobName string) {
 	// Presubmits on main branch are set as "Presubmits"
 	if presubmitRegex.MatchString(jobName) {
 		variants[VariantRelease] = "Presubmits"
@@ -584,19 +683,17 @@ func (v *OCPVariantLoader) setRelease(_ logrus.FieldLogger, variants map[string]
 		}
 	}
 
-	// for jobs with version number(s) in the name, extract lowest and highest to inform upgrade designation
-	release, fromRelease := extractReleases(jobName)
-	if release != "" {
-		releaseMajorMinor := strings.Split(release, ".")
-		variants[VariantRelease] = release
-		variants[VariantReleaseMajor] = releaseMajorMinor[0]
-		variants[VariantReleaseMinor] = releaseMajorMinor[1]
-	}
-	if fromRelease != "" {
-		fromReleaseMajorMinor := strings.Split(fromRelease, ".")
-		variants[VariantFromRelease] = fromRelease
-		variants[VariantFromReleaseMajor] = fromReleaseMajorMinor[0]
-		variants[VariantFromReleaseMinor] = fromReleaseMajorMinor[1]
+	releasesInJobName := extractReleases(jobName)
+	if count := len(releasesInJobName); count > 0 {
+		release := releasesInJobName[count-1]
+		variants[VariantRelease] = release.Original()
+		variants[VariantReleaseMajor] = strconv.Itoa(release.Segments()[0])
+		variants[VariantReleaseMinor] = strconv.Itoa(release.Segments()[1])
+
+		fromRelease := releasesInJobName[0]
+		variants[VariantFromRelease] = fromRelease.Original()
+		variants[VariantFromReleaseMajor] = strconv.Itoa(fromRelease.Segments()[0])
+		variants[VariantFromReleaseMinor] = strconv.Itoa(fromRelease.Segments()[1])
 	}
 
 	// for jobs that look like upgrades, determine upgrade variant
@@ -604,10 +701,8 @@ func (v *OCPVariantLoader) setRelease(_ logrus.FieldLogger, variants map[string]
 		switch {
 		case upgradeOutOfChangeRegex.MatchString(jobName):
 			variants[VariantUpgrade] = "micro-downgrade"
-		case isMultiUpgrade(release, fromRelease):
-			variants[VariantUpgrade] = "multi"
-		case upgradeMinorRegex.MatchString(jobName):
-			variants[VariantUpgrade] = "minor"
+		case upgradeMajorMinorRegex.MatchString(jobName):
+			variants[VariantUpgrade] = upgradeVariant(logger, releasesInJobName, jobName)
 		default:
 			variants[VariantUpgrade] = "micro"
 		}
@@ -618,17 +713,25 @@ func (v *OCPVariantLoader) setRelease(_ logrus.FieldLogger, variants map[string]
 		delete(variants, VariantFromReleaseMajor)
 		delete(variants, VariantFromReleaseMinor)
 	}
+
+	// Synthetic release claims take priority over other release logic.
+	if release, ok := v.syntheticReleaseJobOverrides.Lookup(jobName); ok {
+		variants[VariantRelease] = release
+	}
 }
 
 // setJobTier sets the jobTier for a job, with values like this:
 //
-//		blocking: blocking job on payloads
-//		informing: informing job on payloads
-//		standard: should be visible in default views (component readiness, sippy)
+//		blocking: blocking job on payloads, covered by component readiness
+//		informing: informing job on payloads, covered by component readiness
+//		standard: should be visible in default views (component readiness, sippy), covered by component readiness
 //	 	rare: highly reliable jobs that run at a reduced frequency
-//		candidate: a candidate for being shown in default views, used to gauge the stability and promotability of the job
+//		candidate: not covered by component readiness, but may be promoted in the future
 //		hidden: data should still be synced, but not shown by default
 //		excluded: data should not be synced, and excluded from all views
+//
+// Note: blocking/informing/standard tiers may be downgraded to candidate by
+// adjustJobTierBasedOnView if the job's variants don't match the release-main view.
 func (v *OCPVariantLoader) setJobTier(_ logrus.FieldLogger, variants map[string]string, jobName string) {
 	jobNameLower := strings.ToLower(jobName)
 
@@ -643,19 +746,42 @@ func (v *OCPVariantLoader) setJobTier(_ logrus.FieldLogger, variants map[string]
 		// QE jobs allowlisted for Component Readiness
 		{[]string{"-automated-release"}, "standard"},
 
+		// OVN-Kubernetes BGP Virtualization jobs allowed for Component Readiness
+		{[]string{"-ovn-bgp-virt"}, "standard"},
+
+		// Add two-node-fencing for component readiness
+		{[]string{"-two-node-fencing-recovery"}, "standard"},
+		{[]string{"-two-node-fencing-dualstack-recovery"}, "standard"},
+		{[]string{"-two-node-fencing-ipv6-recovery"}, "standard"},
+
 		// Excluded jobs
 		{[]string{"-okd"}, "excluded"},
 		{[]string{"-recovery"}, "excluded"},
 		{[]string{"alibaba"}, "excluded"},
 		{[]string{"-osde2e-"}, "excluded"},
 
+		// OVN-Kubernetes BGP jobs; candidate tier to collect data while stabilizing
+		{[]string{"-bgp-"}, "candidate"},
+
 		// Experimental new jobs using nested vsphere lvl 2 environment,
 		// not ready to make release blocking yet.
 		{[]string{"-vsphere-host-groups"}, "candidate"},
 
-		// Periodic MCO jobs used for component readiness; not ready to make
-		// release blocking yet.
-		{[]string{"-mco-disruptive"}, "candidate"},
+		// vSphere hybrid-env jobs are not yet stable enough for component readiness
+		{[]string{"-hybrid-env"}, "candidate"},
+
+		// All 4.19/4.20 MCO jobs default to candidate
+		{[]string{"machine-config-operator-release-4.19"}, "candidate"},
+		{[]string{"machine-config-operator-release-4.20"}, "candidate"},
+
+		// Cloud MCO disruptive jobs set to standard for component readiness
+		// This also includes techpreview variants
+		{[]string{"e2e-aws-mco-disruptive"}, "standard"},
+		{[]string{"e2e-azure-mco-disruptive"}, "standard"},
+		{[]string{"e2e-gcp-mco-disruptive"}, "standard"},
+
+		// All remaining MCO periodic jobs default to candidate
+		{[]string{"machine-config-operator"}, "candidate"},
 
 		// Konflux jobs aren't ready yet
 		{[]string{"-konflux"}, "candidate"},
@@ -668,6 +794,9 @@ func (v *OCPVariantLoader) setJobTier(_ logrus.FieldLogger, variants map[string]
 		{[]string{"periodic-ci-openshift-operator-framework-operator-controller-", "-extended-"}, "candidate"},
 		{[]string{"periodic-ci-openshift-operator-framework-olm-", "-extended-"}, "candidate"},
 
+		// GCP multi-operator periodic jobs are not yet stable enough for component readiness
+		{[]string{"e2e-gcp-multi-operator-periodic"}, "candidate"},
+
 		// Hidden jobs
 		{[]string{"-cilium"}, "hidden"},
 		{[]string{"-disruptive"}, "hidden"},
@@ -675,7 +804,6 @@ func (v *OCPVariantLoader) setJobTier(_ logrus.FieldLogger, variants map[string]
 		{[]string{"aggregator-"}, "hidden"},
 		{[]string{"-out-of-change"}, "hidden"},
 		{[]string{"-sno-fips-recert"}, "hidden"},
-		{[]string{"-bgp-"}, "hidden"},
 		{[]string{"aggregated"}, "hidden"},
 		{[]string{"-cert-rotation-shutdown-"}, "hidden"}, // may want to go to rare at some point
 		{[]string{"-vsphere-insights-runtime"}, "hidden"},
@@ -695,6 +823,17 @@ func (v *OCPVariantLoader) setJobTier(_ logrus.FieldLogger, variants map[string]
 
 		// z-stream techpreview jobs should generally upgrade correctly, however also get wedged in some cases (e.g. when we forcibly change an API from alpha to stable).
 		{[]string{"-techpreview-upgrade"}, "candidate"},
+
+		// Custom DNS techpreview jobs - candidate tier to collect data while stabilizing
+		{[]string{"-custom-dns-techpreview"}, "candidate"},
+
+		// AWS European Sovereign Cloud techpreview jobs - candidate tier to collect data while stabilizing
+		{[]string{"-eusc-techpreview"}, "candidate"},
+
+		// AWS DualStack Techpreview jobs - candidate tier to collect data while stabilizing
+		{[]string{"-aws-ovn-dualstack"}, "candidate"},
+		{[]string{"-aws-ovn-installer-dualstack-ipv6-primary-techpreview"}, "candidate"},
+		{[]string{"-aws-ovn-installer-dualstack-ipv4-primary-techpreview"}, "candidate"},
 
 		{[]string{"periodic-ci-openshift-hypershift-", "-mce-e2e-agent-", "-metal-conformance"}, "candidate"},
 	}
@@ -722,16 +861,20 @@ func (v *OCPVariantLoader) setJobTier(_ logrus.FieldLogger, variants map[string]
 
 	// Determine job tier from release configuration
 	release := variants[VariantRelease]
+
+	// after the master -> main branch renaming in release some of the master job names in our config have been renamed
+	// check for the 'main' name as well to determine JobTier
+	mainJobName := strings.Replace(jobName, "-master-", "-main-", 1)
+
 	switch {
-	case util.StrSliceContains(v.config.Releases[release].BlockingJobs, jobName):
+	case util.StrSliceContainsEither(v.config.Releases[release].BlockingJobs, jobName, mainJobName):
 		variants[VariantJobTier] = "blocking"
-	case util.StrSliceContains(v.config.Releases[release].InformingJobs, jobName):
+	case util.StrSliceContainsEither(v.config.Releases[release].InformingJobs, jobName, mainJobName):
 		variants[VariantJobTier] = "informing"
-	case release == "Presubmits", v.config.Releases[release].Jobs[jobName]:
+	case release == "Presubmits", v.config.Releases[release].Jobs[jobName], v.config.Releases[release].Jobs[mainJobName]:
 		variants[VariantJobTier] = "standard"
 	default:
 		variants[VariantJobTier] = "candidate"
-
 	}
 }
 
@@ -797,6 +940,8 @@ func setTopology(_ logrus.FieldLogger, variants map[string]string, jobName strin
 		{"-single-node", "single"},                // Alternative format
 		{"-two-node-arbiter", "two-node-arbiter"}, // Two-node
 		{"-two-node-fencing", "two-node-fencing"}, // Two-node
+		{"-tna-", "two-node-arbiter"},             // Two-node alternative format
+		{"-tnf-", "two-node-fencing"},             // Two-node alternative format
 		{"-hypershift", "external"},
 		{"-hcp", "external"},
 		{"_hcp", "external"},
@@ -843,29 +988,47 @@ func setInstaller(_ logrus.FieldLogger, variants map[string]string, jobName stri
 	variants[VariantInstaller] = "ipi" // Assume ipi by default
 }
 
-// isMultiUpgrade checks if this is a multi-minor upgrade by examining the delta between the release minor
-// and from release minor versions.
-func isMultiUpgrade(release, fromRelease string) bool {
-	if release == "" || fromRelease == "" {
-		return false
+// upgradeVariant returns a variant inferred from the slice of releases involved in a job and its name
+//   - releases need to be sorted and unique
+func upgradeVariant(logger logrus.FieldLogger, releases []version.Version, jobName string) string {
+	count := len(releases)
+	if count > 2 {
+		return "multi"
 	}
 
-	releaseMajorMinor := strings.Split(release, ".")
-	fromReleaseMajorMinor := strings.Split(fromRelease, ".")
+	if count == 2 {
+		fromRelease, toRelease := releases[0], releases[count-1]
+		fromSegments, toSegments := fromRelease.Segments(), toRelease.Segments()
+		fromMajor, fromMinor := fromSegments[0], fromSegments[1]
+		toMajor, toMinor := toSegments[0], toSegments[1]
 
-	releaseMinor, err := strconv.Atoi(releaseMajorMinor[1])
-	if err != nil {
-		return false
+		switch {
+		case fromMajor < toMajor:
+			return "major"
+		case fromMajor == toMajor && (toMinor-fromMinor) == 1:
+			return "minor"
+		case fromMajor == toMajor && (toMinor-fromMinor) > 1:
+			return "multi"
+		default:
+			// should never happen; versions in releases are unique (=> not equal) and sorted (=> from < to)
+			// if this is not true we may misclassify as minor
+			logger.WithFields(
+				logrus.Fields{"fromRelease": fromRelease, "toRelease": toRelease},
+			).Warn("BUG: fromRelease is not lower than toRelease")
+		}
 	}
-	fromReleaseMinor, err := strconv.Atoi(fromReleaseMajorMinor[1])
-	if err != nil {
-		return false
+
+	// if we only have one version then we either take a hint from the job name
+	// or it is a micro
+
+	if strings.Contains(jobName, "-minor") {
+		return "minor"
 	}
-	// If release minor minus from release minor is greater than 1, this is a multi-release upgrade job:
-	if releaseMinor-fromReleaseMinor > 1 {
-		return true
+	if strings.Contains(jobName, "-major") {
+		return "major"
 	}
-	return false
+
+	return "micro"
 }
 
 func setPlatform(jLog logrus.FieldLogger, variants map[string]string, jobName string) {
@@ -909,33 +1072,32 @@ func setPlatform(jLog logrus.FieldLogger, variants map[string]string, jobName st
 	jLog.WithField("jobName", jobName).Warn("unable to determine platform from job name")
 }
 
-func extractReleases(jobName string) (release, fromRelease string) {
-	re := regexp.MustCompile(`\d+\.\d+`)
-	matches := re.FindAllString(jobName, -1)
+var majorMinorRegexp = regexp.MustCompile(`\d+\.\d+`)
 
-	if len(matches) > 0 {
-		minRelease := matches[0]
-		maxRelease := matches[0]
+// extractRelease returns a slice of unique major.minor version strings found in the job name sorted
+// from lowest to highest, assumed to represent the installed (lowest) and final (highest) releases
+// in update jobs
+func extractReleases(jobName string) []version.Version {
+	matches := sets.New(majorMinorRegexp.FindAllString(jobName, -1)...)
 
-		for _, match := range matches {
-			matchNum, _ := strconv.ParseFloat(match, 64)
-			minNum, _ := strconv.ParseFloat(minRelease, 64)
-			maxNum, _ := strconv.ParseFloat(maxRelease, 64)
+	mm := make([]version.Version, 0, len(matches))
 
-			if matchNum < minNum {
-				minRelease = match
-			}
-
-			if matchNum > maxNum {
-				maxRelease = match
-			}
+	for match := range matches {
+		// two items and successful conversion are pretty much guaranteed on regex matches but there are corner cases
+		if v, err := version.NewVersion(match); err == nil && v != nil {
+			mm = append(mm, *v)
 		}
-
-		release = maxRelease
-		fromRelease = minRelease
 	}
 
-	return release, fromRelease
+	if len(mm) == 0 {
+		return nil
+	}
+
+	sort.Slice(mm, func(i, j int) bool {
+		return mm[i].LessThan(&mm[j])
+	})
+
+	return mm
 }
 
 func setArchitecture(_ logrus.FieldLogger, variants map[string]string, jobName string) {
@@ -1000,21 +1162,13 @@ func setNetwork(jLog logrus.FieldLogger, variants map[string]string, jobName str
 	}
 
 	// Get release version from variants
-	release, exists := variants[VariantFromRelease]
-	if !exists {
-		release, exists = variants[VariantRelease] // fall back to main release for non-upgrade jobs
-	}
-	if !exists {
-		jLog.Warning("release version not found, unable to guess container runtime")
+	releaseVersion := releaseVersionFromVariants(jLog, variants)
+	if releaseVersion == nil {
+		return
 	}
 
 	// Determine network based on release
 	ovnBecomesDefault, _ := version.NewVersion("4.12")
-	releaseVersion, err := version.NewVersion(release)
-	if err != nil {
-		jLog.WithField("release", release).Warning("could not parse release version, unable to guess network type")
-		return
-	}
 
 	if releaseVersion.GreaterThanOrEqual(ovnBecomesDefault) {
 		variants[VariantNetwork] = "ovn"
@@ -1043,27 +1197,43 @@ func setContainerRuntime(jLog logrus.FieldLogger, variants map[string]string, jo
 	}
 
 	// Get release version from variants
-	release, exists := variants[VariantFromRelease]
-	if !exists {
-		release, exists = variants[VariantRelease] // fall back to main release for non-upgrade jobs
-	}
-	if !exists {
-		jLog.Warning("release version not found, unable to guess container runtime")
+	releaseVersion := releaseVersionFromVariants(jLog, variants)
+	if releaseVersion == nil {
+		return
 	}
 
 	// Determine container runtime based on release
 	crunBecomesDefault, _ := version.NewVersion("4.18")
-	releaseVersion, err := version.NewVersion(release)
-	if err != nil {
-		jLog.WithField("release", release).Warning("could not parse release version for container runtime type")
-		return
-	}
 
 	if releaseVersion.GreaterThanOrEqual(crunBecomesDefault) {
 		variants[VariantContainerRuntime] = "crun"
 	} else {
 		variants[VariantContainerRuntime] = "runc"
 	}
+}
+
+func releaseVersionFromVariants(jLog logrus.FieldLogger, variants map[string]string) *version.Version {
+	release, exists := variants[VariantFromRelease]
+	if !exists {
+		release, exists = variants[VariantRelease]
+	}
+	if exists {
+		if v, err := version.NewVersion(release); err == nil {
+			return v
+		}
+	}
+
+	// Synthetic releases will not be able to determine the release version using the VariantRelease or VariantFromRelease
+	// We can attempt to determine it via the VariantReleaseMajor and VariantReleaseMinor variants.
+	if major, ok := variants[VariantReleaseMajor]; ok {
+		if minor, ok := variants[VariantReleaseMinor]; ok {
+			if v, err := version.NewVersion(major + "." + minor); err == nil {
+				return v
+			}
+		}
+	}
+	jLog.Warning("release version not found, unable to determine version-dependent variant")
+	return nil
 }
 
 func setCGroupMode(_ logrus.FieldLogger, variants map[string]string, jobName string) {
@@ -1093,6 +1263,19 @@ func setLayeredProduct(_ logrus.FieldLogger, variants map[string]string, jobName
 		product   string
 	}{
 		{"-lp-interop-cr-cnv", "lp-interop-virt"},
+		{"-quay-cr", "lp-interop-quay"},
+		{"-lp-interop-cr-openshift-pipelines", "lp-interop-openshift-pipelines"},
+		{"-lp-interop-cr-acs-latest", "lp-interop-acs-latest"},
+		{"-lp-interop-cr-acs", "lp-interop-acs"},
+		{"-lp-interop-cr-odf", "lp-interop-odf"},
+		{"-lp-interop-cr-redhat-openshift-gitops", "lp-interop-gitops"},
+		{"-lp-interop-cr-fusion-access", "lp-interop-fusion-access"},
+		{"-lp-interop-cr-mta", "lp-interop-mta"},
+		{"-lp-interop-cr-mycomp", "lp-interop-mycomp"},
+		{"-lp-interop-cr-oadp", "lp-interop-oadp"},
+		{"-lp-interop-cr-servicemesh", "lp-interop-servicemesh"},
+		{"-lp-interop-cr-operator-e2e", "lp-interop-serverless"},
+		{"-coo-", "lp-interop-coo"},
 		{"-virt", "virt"},
 		{"-cnv", "virt"},
 		{"-kubevirt", "virt"},
@@ -1111,18 +1294,32 @@ func setLayeredProduct(_ logrus.FieldLogger, variants map[string]string, jobName
 func setOS(_ logrus.FieldLogger, variants map[string]string, jobName string) {
 	jobNameLower := strings.ToLower(jobName)
 
+	// Order matters: check rhcos9-10 before rhcos10 and rhcos9 to avoid false matches.
 	osPatterns := []struct {
 		substring string
 		os        string
 	}{
+		{"rhcos9-10", "rhcos9-10"},
 		{"rhcos10", "rhcos10"},
+		{"rhcos9", "rhcos9"},
 	}
 
-	variants[VariantOS] = "rhcos9"
 	for _, entry := range osPatterns {
 		if strings.Contains(jobNameLower, entry.substring) {
 			variants[VariantOS] = entry.os
 			return
 		}
+	}
+
+	// No explicit rhcos fragment in the job name: fall back based on OCP major version.
+	isMainBranch := strings.Contains(jobNameLower, "-main-") || strings.Contains(jobNameLower, "-master-")
+	switch {
+	case variants[VariantReleaseMajor] == "4":
+		variants[VariantOS] = "rhcos9"
+	case variants[VariantReleaseMajor] == "5" || isMainBranch:
+		// OCP 5 currently defaults to rhcos9. Update this when the default changes.
+		variants[VariantOS] = "rhcos9"
+	default:
+		variants[VariantOS] = "unknown"
 	}
 }

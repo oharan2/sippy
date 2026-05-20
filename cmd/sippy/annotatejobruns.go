@@ -8,10 +8,12 @@ import (
 	"time"
 
 	"github.com/openshift/sippy/pkg/api/componentreadiness"
-	"github.com/openshift/sippy/pkg/apis/api/componentreport/bq"
+	bqprovider "github.com/openshift/sippy/pkg/api/componentreadiness/dataprovider/bigquery"
+	"github.com/openshift/sippy/pkg/apis/api/componentreport/crstatus"
 	"github.com/openshift/sippy/pkg/apis/api/componentreport/crtest"
 	"github.com/openshift/sippy/pkg/apis/cache"
 	bqcachedclient "github.com/openshift/sippy/pkg/bigquery"
+	"github.com/openshift/sippy/pkg/bigquery/bqlabel"
 	"github.com/openshift/sippy/pkg/componentreadiness/jobrunannotator"
 	"github.com/openshift/sippy/pkg/dataloader/prowloader/gcs"
 	"github.com/openshift/sippy/pkg/flags/configflags"
@@ -31,7 +33,7 @@ type AnnotateJobRunsFlags struct {
 	ComponentReadinessFlags *flags.ComponentReadinessFlags
 	ConfigFlags             *configflags.ConfigFlags
 	VariantStr              []string
-	Variants                []bq.Variant
+	Variants                []crstatus.Variant
 	Release                 string
 	Label                   string
 	BuildClusters           []string
@@ -103,7 +105,7 @@ func (f *AnnotateJobRunsFlags) Validate(allVariants crtest.JobVariants) error {
 		if !found {
 			return fmt.Errorf("--variant %s has wrong variant value %s", variantStr, vt[1])
 		}
-		f.Variants = append(f.Variants, bq.Variant{Key: vt[0], Value: vt[1]})
+		f.Variants = append(f.Variants, crstatus.Variant{Key: vt[0], Value: vt[1]})
 	}
 	if len(f.Label) == 0 {
 		return fmt.Errorf("--label is required")
@@ -136,16 +138,25 @@ Example run: sippy annotate-job-runs  --google-service-account-credential-file=f
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Hour*1)
 			defer cancel()
+			ctx = context.WithValue(ctx, bqcachedclient.RequestContextKey, bqlabel.RequestContext{User: f.User})
+
+			opCtx := bqlabel.OperationalContext{
+				App:         bqlabel.AppSippy,
+				Command:     "annotate-job-runs",
+				Environment: bqlabel.EnvCli,
+			}
 
 			cacheClient, err := f.CacheFlags.GetCacheClient()
 			if err != nil {
 				log.WithError(err).Fatal("couldn't get cache client")
 			}
 
-			bigQueryClient, err := bqcachedclient.New(ctx,
+			bigQueryClient, err := bqcachedclient.New(
+				ctx, opCtx, cacheClient,
 				f.GoogleCloudFlags.ServiceAccountCredentialFile,
 				f.BigQueryFlags.BigQueryProject,
-				f.BigQueryFlags.BigQueryDataset, cacheClient, f.BigQueryFlags.ReleasesTable)
+				f.BigQueryFlags.BigQueryDataset,
+				f.BigQueryFlags.ReleasesTable)
 			if err != nil {
 				log.WithError(err).Fatal("error getting BigQuery client")
 			}
@@ -169,9 +180,9 @@ Example run: sippy annotate-job-runs  --google-service-account-credential-file=f
 				return errors.WithMessage(err, "couldn't get DB client")
 			}
 
-			allVariants, errs := componentreadiness.GetJobVariantsFromBigQuery(ctx, bigQueryClient)
+			allVariants, errs := componentreadiness.GetJobVariants(ctx, bqprovider.NewBigQueryProvider(bigQueryClient, nil))
 			if len(errs) > 0 {
-				return fmt.Errorf("failed to get variants from bigquery")
+				return fmt.Errorf("failed to get job variants: %v", errs)
 			}
 			if err = f.Validate(allVariants); err != nil {
 				return errors.WithMessage(err, "error validating options")

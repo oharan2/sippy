@@ -69,10 +69,12 @@ func TestGenerateTestDetailsURL(t *testing.T) {
 		url, err := GenerateTestDetailsURL(
 			"test-id",
 			"",
+			"", // viewName
 			getBaseReleaseOpts(),
 			getSampleReleaseOpts(),
 			testView.AdvancedOptions,
 			testView.VariantOptions,
+			reqopts.TestFilters{},
 			"",
 			"",
 			[]string{"Platform:aws"},
@@ -86,10 +88,12 @@ func TestGenerateTestDetailsURL(t *testing.T) {
 		_, err := GenerateTestDetailsURL(
 			"",
 			"https://example.com",
+			"", // viewName
 			getBaseReleaseOpts(),
 			getSampleReleaseOpts(),
 			testView.AdvancedOptions,
 			testView.VariantOptions,
+			reqopts.TestFilters{},
 			"",
 			"",
 			[]string{},
@@ -103,10 +107,12 @@ func TestGenerateTestDetailsURL(t *testing.T) {
 		url, err := GenerateTestDetailsURL(
 			"test-id",
 			"",
+			"", // viewName
 			getBaseReleaseOpts(),
 			getSampleReleaseOpts(),
 			testView.AdvancedOptions,
 			testView.VariantOptions,
+			reqopts.TestFilters{},
 			"",
 			"",
 			[]string{"Architecture:amd64", "InvalidVariant", "Platform:aws"},
@@ -124,10 +130,12 @@ func TestGenerateTestDetailsURL(t *testing.T) {
 		url, err := GenerateTestDetailsURL(
 			"test-id",
 			"",
+			"", // viewName
 			getBaseReleaseOpts(),
 			getSampleReleaseOpts(),
 			testView.AdvancedOptions,
 			testView.VariantOptions,
+			reqopts.TestFilters{},
 			"",
 			"",
 			// Use variants in non-alphabetical order to test sorting
@@ -144,10 +152,12 @@ func TestGenerateTestDetailsURL(t *testing.T) {
 		url, err := GenerateTestDetailsURL(
 			"openshift-tests:abc123",
 			"https://sippy.example.com",
+			"", // viewName
 			getBaseReleaseOpts(),
 			getSampleReleaseOpts(),
 			testView.AdvancedOptions,
 			testView.VariantOptions,
+			reqopts.TestFilters{},
 			"component-example",
 			"capability-example",
 			[]string{"Architecture:amd64", "Platform:aws"},
@@ -176,10 +186,12 @@ func TestGenerateTestDetailsURL(t *testing.T) {
 		url, err := GenerateTestDetailsURL(
 			"openshift-tests:abc123",
 			"https://sippy.example.com",
+			"", // viewName
 			getBaseReleaseOpts(),
 			getSampleReleaseOpts(),
 			testView.AdvancedOptions,
 			testView.VariantOptions,
+			reqopts.TestFilters{},
 			"",
 			"",
 			[]string{"Architecture:amd64", "Platform:aws"},
@@ -241,10 +253,12 @@ func TestGenerateTestDetailsURL(t *testing.T) {
 		url, err := GenerateTestDetailsURL(
 			"openshift-tests:9f3fb60052539c29ab66564689f616ce",
 			"https://sippy-auth.dptools.openshift.org",
+			"", // viewName
 			baseReleaseOpts,
 			sampleReleaseOpts,
 			realWorldView.AdvancedOptions,
 			realWorldView.VariantOptions,
+			reqopts.TestFilters{},
 			"",
 			"",
 			[]string{
@@ -337,10 +351,12 @@ func TestGenerateTestDetailsURL(t *testing.T) {
 		url, err := GenerateTestDetailsURL(
 			"test-id",
 			"https://example.com",
+			"", // viewName
 			baseReleaseOpts,
 			sampleReleaseOpts,
 			viewWithVariants.AdvancedOptions,
 			viewWithVariants.VariantOptions,
+			reqopts.TestFilters{},
 			"",
 			"",
 			[]string{},
@@ -361,6 +377,232 @@ func TestGenerateTestDetailsURL(t *testing.T) {
 		// Check that the order is correct by looking at the raw query
 		// The URL encoding makes this a bit tricky, but we can check the pattern
 		assert.Regexp(t, `includeVariant=Architecture.*includeVariant=Network.*includeVariant=Platform`, url)
+	})
+
+	t.Run("variant cross-compare parameters are included", func(t *testing.T) {
+		// Create a view with variant cross-compare settings
+		viewWithCrossCompare := crview.View{
+			Name: "test-view-with-cross-compare",
+			BaseRelease: reqopts.RelativeRelease{
+				Release: reqopts.Release{
+					Name: "4.19",
+				},
+				RelativeStart: "ga-30d",
+				RelativeEnd:   "ga",
+			},
+			SampleRelease: reqopts.RelativeRelease{
+				Release: reqopts.Release{
+					Name: "4.20",
+				},
+				RelativeStart: "ga-7d",
+				RelativeEnd:   "ga",
+			},
+			VariantOptions: reqopts.Variants{
+				IncludeVariants: map[string][]string{
+					"Architecture": {"amd64"},
+					"Platform":     {"aws"},
+					"Topology":     {"ha"},
+				},
+				VariantCrossCompare: []string{"Architecture", "Topology"},
+				CompareVariants: map[string][]string{
+					"Architecture": {"s390x", "ppc64le"},
+					"Topology":     {"single"},
+				},
+			},
+			AdvancedOptions: reqopts.Advanced{
+				MinimumFailure: 3,
+				Confidence:     95,
+				PityFactor:     5,
+			},
+		}
+
+		baseReleaseOpts, err := GetViewReleaseOptions(releases, "basis", viewWithCrossCompare.BaseRelease, 0)
+		require.NoError(t, err)
+		sampleReleaseOpts, err := GetViewReleaseOptions(releases, "sample", viewWithCrossCompare.SampleRelease, 0)
+		require.NoError(t, err)
+
+		url, err := GenerateTestDetailsURL(
+			"test-id-123",
+			"https://example.com",
+			"", // viewName
+			baseReleaseOpts,
+			sampleReleaseOpts,
+			viewWithCrossCompare.AdvancedOptions,
+			viewWithCrossCompare.VariantOptions,
+			reqopts.TestFilters{},
+			"",
+			"",
+			[]string{"Platform:aws"},
+			"",
+		)
+		require.NoError(t, err)
+
+		// Verify includeVariant parameters are present
+		assert.Contains(t, url, "includeVariant=Architecture%3Aamd64")
+		assert.Contains(t, url, "includeVariant=Platform%3Aaws")
+		assert.Contains(t, url, "includeVariant=Topology%3Aha")
+
+		// Verify variantCrossCompare parameters are present and sorted
+		assert.Contains(t, url, "variantCrossCompare=Architecture")
+		assert.Contains(t, url, "variantCrossCompare=Topology")
+
+		// Verify compareVariant parameters are present and sorted
+		assert.Contains(t, url, "compareVariant=Architecture%3Appc64le")
+		assert.Contains(t, url, "compareVariant=Architecture%3As390x")
+		assert.Contains(t, url, "compareVariant=Topology%3Asingle")
+
+		// Verify the order is correct (Architecture before Topology)
+		assert.Regexp(t, `variantCrossCompare=Architecture.*variantCrossCompare=Topology`, url)
+		assert.Regexp(t, `compareVariant=Architecture.*compareVariant=Topology`, url)
+	})
+
+	t.Run("URL generation with PR options", func(t *testing.T) {
+		// Create a sample release with PR options
+		sampleReleaseWithPR := reqopts.Release{
+			Name:  "4.20",
+			Start: time.Date(2025, 5, 25, 0, 0, 0, 0, time.UTC),
+			End:   time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC),
+			PullRequestOptions: &reqopts.PullRequest{
+				Org:      "openshift",
+				Repo:     "origin",
+				PRNumber: "12345",
+			},
+		}
+
+		url, err := GenerateTestDetailsURL(
+			"test-id",
+			"https://sippy.example.com",
+			"", // viewName
+			getBaseReleaseOpts(),
+			sampleReleaseWithPR,
+			testView.AdvancedOptions,
+			testView.VariantOptions,
+			reqopts.TestFilters{},
+			"",
+			"",
+			[]string{"Platform:aws"},
+			"",
+		)
+		require.NoError(t, err)
+		assert.NotEmpty(t, url)
+
+		// Verify PR parameters are included
+		assert.Contains(t, url, "samplePROrg=openshift")
+		assert.Contains(t, url, "samplePRRepo=origin")
+		assert.Contains(t, url, "samplePRNumber=12345")
+	})
+
+	t.Run("URL generation with Payload options", func(t *testing.T) {
+		// Create a sample release with Payload options
+		sampleReleaseWithPayload := reqopts.Release{
+			Name:  "4.20",
+			Start: time.Date(2025, 5, 25, 0, 0, 0, 0, time.UTC),
+			End:   time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC),
+			PayloadOptions: &reqopts.Payload{
+				Tags: []string{"tag1", "tag2"},
+			},
+		}
+
+		url, err := GenerateTestDetailsURL(
+			"test-id",
+			"https://sippy.example.com",
+			"", // viewName
+			getBaseReleaseOpts(),
+			sampleReleaseWithPayload,
+			testView.AdvancedOptions,
+			testView.VariantOptions,
+			reqopts.TestFilters{},
+			"",
+			"",
+			[]string{"Platform:aws"},
+			"",
+		)
+		require.NoError(t, err)
+		assert.NotEmpty(t, url)
+
+		// Verify Payload parameters are included
+		assert.Contains(t, url, "samplePayloadTag=tag1")
+		assert.Contains(t, url, "samplePayloadTag=tag2")
+	})
+
+	t.Run("URL generation with test filters", func(t *testing.T) {
+		// Create test filters
+		testFilters := reqopts.TestFilters{
+			Capabilities: []string{"Networking", "Storage"},
+			Lifecycles:   []string{"blocking", "informing"},
+		}
+
+		url, err := GenerateTestDetailsURL(
+			"test-id",
+			"https://sippy.example.com",
+			"", // viewName
+			getBaseReleaseOpts(),
+			getSampleReleaseOpts(),
+			testView.AdvancedOptions,
+			testView.VariantOptions,
+			testFilters,
+			"",
+			"",
+			[]string{"Platform:aws"},
+			"",
+		)
+		require.NoError(t, err)
+		assert.NotEmpty(t, url)
+
+		// Verify test filter parameters are included
+		assert.Contains(t, url, "testCapabilities=Networking")
+		assert.Contains(t, url, "testCapabilities=Storage")
+		assert.Contains(t, url, "testLifecycles=blocking")
+		assert.Contains(t, url, "testLifecycles=informing")
+	})
+
+	t.Run("URL generation with view name includes both view and all parameters", func(t *testing.T) {
+		// Create test filters
+		testFilters := reqopts.TestFilters{
+			Capabilities: []string{"Networking"},
+			Lifecycles:   []string{"blocking"},
+		}
+
+		url, err := GenerateTestDetailsURL(
+			"test-id",
+			"https://sippy.example.com",
+			"4.20-main", // viewName provided
+			getBaseReleaseOpts(),
+			getSampleReleaseOpts(),
+			testView.AdvancedOptions,
+			testView.VariantOptions,
+			testFilters,
+			"component-example",
+			"capability-example",
+			[]string{"Platform:aws", "Architecture:amd64"},
+			"",
+		)
+		require.NoError(t, err)
+		assert.NotEmpty(t, url)
+
+		// Verify view parameter is included
+		assert.Contains(t, url, "view=4.20-main")
+
+		// Verify all other parameters are also included (not just view+overrides)
+		assert.Contains(t, url, "testId=test-id")
+		assert.Contains(t, url, "baseRelease=4.19")
+		assert.Contains(t, url, "sampleRelease=4.20")
+		assert.Contains(t, url, "confidence=95")
+		assert.Contains(t, url, "minFail=3")
+		assert.Contains(t, url, "pity=5")
+		assert.Contains(t, url, "includeMultiReleaseAnalysis=true")
+		assert.Contains(t, url, "component=component-example")
+		assert.Contains(t, url, "capability=capability-example")
+		assert.Contains(t, url, "Platform=aws")
+		assert.Contains(t, url, "Architecture=amd64")
+		assert.Contains(t, url, "testCapabilities=Networking")
+		assert.Contains(t, url, "testLifecycles=blocking")
+
+		// Verify the URL contains all expected components from the view
+		assert.Contains(t, url, "baseStartTime=")
+		assert.Contains(t, url, "baseEndTime=")
+		assert.Contains(t, url, "sampleStartTime=")
+		assert.Contains(t, url, "sampleEndTime=")
 	})
 
 }

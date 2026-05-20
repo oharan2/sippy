@@ -1,11 +1,13 @@
-import { Box, Button, Tooltip } from '@mui/material'
+import { Box, Button, Chip, Tooltip } from '@mui/material'
 import { CheckCircle, Error as ErrorIcon } from '@mui/icons-material'
 import { CompReadyVarsContext } from './CompReadyVars'
 import { formatDateToSeconds, relativeTime } from '../helpers'
 import {
+  getTestDetailsLink,
   getTriagesAPIUrl,
   hasFailedFixRegression,
   jiraUrlPrefix,
+  jiraUrlPrefixDeprecated,
 } from './CompReadyUtils'
 import { SippyCapabilitiesContext } from '../App'
 import { usePageContextForChat } from '../chat/store/useChatStore'
@@ -14,7 +16,7 @@ import AskSippyButton from '../chat/AskSippyButton'
 import CompSeverityIcon from './CompSeverityIcon'
 import LaunderedLink from '../components/Laundry'
 import PropTypes from 'prop-types'
-import React, { Fragment, useContext } from 'react'
+import React, { Fragment, useContext, useState } from 'react'
 import Table from '@mui/material/Table'
 import TableBody from '@mui/material/TableBody'
 import TableCell from '@mui/material/TableCell'
@@ -22,6 +24,7 @@ import TableRow from '@mui/material/TableRow'
 import TriageAuditLogsModal from './TriageAuditLogsModal'
 import TriagedRegressionTestList from './TriagedRegressionTestList'
 import TriagePotentialMatches from './TriagePotentialMatches'
+import TriageSymptoms from './TriageSymptoms'
 import UpsertTriageModal from './UpsertTriageModal'
 
 export default function Triage({ id }) {
@@ -32,6 +35,7 @@ export default function Triage({ id }) {
   const [triage, setTriage] = React.useState({})
   const [message, setMessage] = React.useState('')
   const [isUpdated, setIsUpdated] = React.useState(false)
+  const [symptomFilter, setSymptomFilter] = useState(null)
   const capabilitiesContext = React.useContext(SippyCapabilitiesContext)
   const triageEnabled = capabilitiesContext.includes('write_endpoints')
   const localDBEnabled = capabilitiesContext.includes('local_db')
@@ -49,14 +53,14 @@ export default function Triage({ id }) {
     let triageFetch
     // triage entries will only be available when there is a postgres connection
     if (localDBEnabled) {
-      triageFetch = fetch(`${getTriagesAPIUrl(id)}?expand=regressions`).then(
-        (response) => {
-          if (response.status !== 200) {
-            throw new Error('API server returned ' + response.status)
-          }
-          return response.json()
+      triageFetch = fetch(
+        `${getTriagesAPIUrl(id)}?expand=regressions,symptoms`
+      ).then((response) => {
+        if (response.status !== 200) {
+          throw new Error('API server returned ' + response.status)
         }
-      )
+        return response.json()
+      })
     } else {
       triageFetch = Promise.resolve({})
     }
@@ -76,27 +80,27 @@ export default function Triage({ id }) {
   React.useEffect(() => {
     if (!isLoaded || !triage.id) return
 
-    // Generate test details links for regressed tests
-    const regressedTestsWithLinks = []
-    if (triage.regressed_tests && triage.regressed_tests.length > 0) {
-      triage.regressed_tests.forEach((regressedTest) => {
-        regressedTestsWithLinks.push({
-          test_name: regressedTest.test_name,
-          component: regressedTest.component,
-          capability: regressedTest.capability,
-          environment: regressedTest.environment,
-          test_id: regressedTest.test_id,
-          status: regressedTest.status,
-          explanations: regressedTest.explanations || [],
-          test_details_api_url: regressedTest.links?.test_details || null,
-          regression_id: regressedTest.regression?.id,
-          regression_opened: regressedTest.regression?.opened,
-          regression_closed: regressedTest.regression?.closed?.valid
-            ? regressedTest.regression.closed.time
-            : null,
-        })
-      })
-    }
+    const regressedTestsForContext = (
+      triage.regressed_tests
+        ? Object.values(triage.regressed_tests).filter(Boolean).flat()
+        : []
+    ).map((rt) => {
+      return {
+        test_name: rt.test_name,
+        component: rt.component,
+        capability: rt.capability,
+        environment: rt.environment,
+        test_id: rt.test_id,
+        status: rt.status,
+        explanations: rt.explanations || [],
+        test_details_api_url: getTestDetailsLink(rt.links, view) ?? null,
+        regression_id: rt.regression?.id,
+        regression_opened: rt.regression?.opened,
+        regression_closed: rt.regression?.closed?.valid
+          ? rt.regression.closed.time
+          : null,
+      }
+    })
 
     const contextData = {
       page: 'triage-details',
@@ -130,7 +134,7 @@ export default function Triage({ id }) {
         triage_id: triage.id,
         view: view,
         jira_issue_key: extractJiraIssueKey(triage.url),
-        regressed_tests: regressedTestsWithLinks,
+        regressed_tests: regressedTestsForContext,
         has_failed_fix: hasFailedFixRegression(triage, triage.regressed_tests),
       },
     }
@@ -166,7 +170,12 @@ export default function Triage({ id }) {
 
   const extractJiraIssueKey = (url) => {
     if (!url) return null
-    return url.startsWith(jiraUrlPrefix) ? url.slice(jiraUrlPrefix.length) : url
+    if (url.startsWith(jiraUrlPrefix)) {
+      url = url.slice(jiraUrlPrefix.length)
+    } else if (url.startsWith(jiraUrlPrefixDeprecated)) {
+      url = url.slice(jiraUrlPrefixDeprecated.length)
+    }
+    return url
   }
 
   if (message !== '') {
@@ -195,6 +204,11 @@ export default function Triage({ id }) {
           {localDBEnabled && <TriageAuditLogsModal triage={triage} />}
           {triageEnabled && (
             <Fragment>
+              <TriagePotentialMatches
+                triage={triage}
+                setMessage={setMessage}
+                setLinkingComplete={setIsUpdated}
+              />
               <UpsertTriageModal
                 triage={triage}
                 buttonText={'Update'}
@@ -311,7 +325,9 @@ export default function Triage({ id }) {
           <TableRow>
             <TableCell>Jira Version</TableCell>
             <TableCell>
-              {triage.bug?.target_versions || triage.bug?.affects_versions}
+              {triage.bug?.target_versions?.filter(Boolean).length
+                ? triage.bug.target_versions.filter(Boolean).join(', ')
+                : triage.bug?.affects_versions?.filter(Boolean).join(', ')}
             </TableCell>
           </TableRow>
           <TableRow>
@@ -339,19 +355,33 @@ export default function Triage({ id }) {
           </TableRow>
         </TableBody>
       </Table>
+      <TriageSymptoms
+        symptomSummaries={triage.symptom_summaries}
+        symptomFilter={symptomFilter}
+        setSymptomFilter={setSymptomFilter}
+      />
       <h2>Included Tests</h2>
+      {symptomFilter && (
+        <Box sx={{ mb: 1 }}>
+          <Chip
+            label={`Filtered by: ${
+              triage.symptom_summaries?.find(
+                (ss) => ss.symptom.id === symptomFilter
+              )?.symptom.summary || symptomFilter
+            }`}
+            onDelete={() => setSymptomFilter(null)}
+            color="primary"
+            variant="outlined"
+          />
+        </Box>
+      )}
       <TriagedRegressionTestList
         allRegressedTests={triage.regressed_tests}
         regressions={triage.regressions}
         filterVals={`?view=${view}`}
+        symptomFilter={symptomFilter}
+        symptomSummaries={triage.symptom_summaries}
       />
-      {triageEnabled && (
-        <TriagePotentialMatches
-          triage={triage}
-          setMessage={setMessage}
-          setLinkingComplete={setIsUpdated}
-        />
-      )}
     </Fragment>
   )
 }

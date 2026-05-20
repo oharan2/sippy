@@ -75,7 +75,8 @@ export const cancelledDataTable = {
     },
   ],
 }
-export const jiraUrlPrefix = 'https://issues.redhat.com/browse/'
+export const jiraUrlPrefixDeprecated = 'https://issues.redhat.com/browse/'
+export const jiraUrlPrefix = 'https://redhat.atlassian.net/browse/'
 
 // Make one place to create the Component Readiness api call
 export function getAPIUrl(endpoint) {
@@ -441,6 +442,9 @@ export function getUpdatedUrlParts(vars) {
   vars.testCapabilities.forEach((item) => {
     queryParams.append('testCapabilities', item)
   })
+  vars.testLifecycles.forEach((item) => {
+    queryParams.append('testLifecycles', item)
+  })
 
   // Stringify and put the begin param character.
   queryParams.sort() // ensure they always stay in sorted order to prevent url history changes
@@ -802,12 +806,50 @@ export function compareUrlQueryParams(newURL, oldURL) {
   return differences
 }
 
+// Convert API URL to UI URL
+// API URL format: http://localhost:8080/api/component_readiness/test_details?...
+// UI URL format:  http://localhost:3000/sippy-ng/component_readiness/test_details?...
+export function convertApiUrlToUiUrl(apiUrl) {
+  console.log('convertApiUrlToUiUrl input:', apiUrl)
+  let result
+  // Handle the most specific case first
+  if (apiUrl.includes('/api/component_readiness/')) {
+    result = apiUrl.replace(
+      '/api/component_readiness/',
+      '/sippy-ng/component_readiness/'
+    )
+  } else if (apiUrl.startsWith('/api/')) {
+    // Handle general /api/ prefix (for relative URLs)
+    result = apiUrl.replace('/api/', '/sippy-ng/')
+  } else {
+    // Fallback: return as-is
+    result = apiUrl
+  }
+  console.log('convertApiUrlToUiUrl output:', result)
+  return result
+}
+
+// Extracts the test_details link from HATEOAS links. Prefers the plain
+// "test_details" key (used by regressed tests in component reports), then
+// tries "test_details:<viewName>" if a viewName is given, then falls back
+// to the first "test_details:*" composite key (used by regression objects).
+export function getTestDetailsLink(links, viewName) {
+  if (!links) return null
+  if (links['test_details']) return links['test_details']
+  if (viewName) {
+    return links[`test_details:${viewName}`] || null
+  }
+  const key = Object.keys(links).find((k) => k.startsWith('test_details:'))
+  return key ? links[key] : null
+}
+
 // Construct a URL with all existing filters utilizing the necessary info from the regressed test.
 // We pass these arguments to the component that generates the test details report.
 export function generateTestDetailsReportLink(
   regressedTest,
   filterVals,
-  expandEnvironment
+  expandEnvironment,
+  viewName
 ) {
   // Generate the URL we would have created for comparison
   const environmentVal = formColumnName({ variants: regressedTest.variants })
@@ -832,27 +874,21 @@ export function generateTestDetailsReportLink(
     `&testName=${safeTestName}`
 
   const sortedGeneratedUrl = sortQueryParams(generatedUrl)
-  // Check if regressedTest.links.test_details is defined
-  if (regressedTest.links?.test_details) {
+  const testDetailsUrl = getTestDetailsLink(regressedTest.links, viewName)
+  if (testDetailsUrl) {
     // Compare the query parameters between the two URLs
     console.log(
       'Comparing query parameters between provided URL and generated URL:'
     )
-    compareUrlQueryParams(regressedTest.links.test_details, sortedGeneratedUrl)
+    compareUrlQueryParams(testDetailsUrl, sortedGeneratedUrl)
 
     // We are assuming the API query params are identical to the UI query params, but we have to adjust the host port and prefix from
     // http://localhost:8080/api/ to http://localhost:3000/sippy-ng/
     // This hack allows us to keep the param generation logic in one place. (server side)
-    const testDetailsUrl = regressedTest.links.test_details
     console.log('testDetailsUrl', testDetailsUrl)
-    const apiIndex = testDetailsUrl.indexOf('/api/')
-    if (apiIndex !== -1) {
-      const pathAfterApi = testDetailsUrl.substring(apiIndex + 5) // +5 to skip '/api/'
-      const modifiedUrl = '/sippy-ng/' + pathAfterApi
-      console.log('modifiedUrl', modifiedUrl)
-      return modifiedUrl
-    }
-    return testDetailsUrl
+    const modifiedUrl = convertApiUrlToUiUrl(testDetailsUrl)
+    console.log('modifiedUrl', modifiedUrl)
+    return modifiedUrl
   }
   console.log(
     'WARNING: report had no test details url, using old generated url: ' +
@@ -862,18 +898,40 @@ export function generateTestDetailsReportLink(
   return generatedUrl
 }
 
-// Helper function to check if triage has any regressions with status -1000 (failed fix)
-// Always performs filtering against the provided regressed tests list
+const SYMPTOM_COLORS = [
+  '#1976d2',
+  '#d32f2f',
+  '#388e3c',
+  '#f57c00',
+  '#7b1fa2',
+  '#0097a7',
+  '#c2185b',
+  '#455a64',
+  '#5d4037',
+  '#303f9f',
+]
+
+export function symptomColor(symptomId) {
+  let hash = 0
+  for (let i = 0; i < symptomId.length; i++) {
+    hash = (hash * 31 + symptomId.charCodeAt(i)) | 0
+  }
+  return SYMPTOM_COLORS[Math.abs(hash) % SYMPTOM_COLORS.length]
+}
+
+// Helper function to check if triage has any regressions with status -1000 (failed fix).
+// allRegressedTests is a map of view name to array of regressed tests.
 export function hasFailedFixRegression(triage, allRegressedTests) {
-  if (!allRegressedTests || !allRegressedTests.length || !triage.regressions) {
+  const tests = allRegressedTests ? Object.values(allRegressedTests).flat() : []
+  if (!tests.length || !triage.regressions) {
     return false
   }
 
   // Get regression IDs from this triage
   const triageRegressionIds = triage.regressions.map((r) => r.id)
 
-  // Filter allRegressedTests to find those matching this triage's regressions
-  const relevantRegressedTests = allRegressedTests.filter(
+  // Filter tests to find those matching this triage's regressions
+  const relevantRegressedTests = tests.filter(
     (rt) => rt?.regression?.id && triageRegressionIds.includes(rt.regression.id)
   )
 

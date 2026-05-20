@@ -4,7 +4,6 @@ import (
 	"math/big"
 	"time"
 
-	"cloud.google.com/go/civil"
 	"github.com/openshift/sippy/pkg/apis/api/componentreport/crtest"
 	"github.com/openshift/sippy/pkg/db/models"
 )
@@ -18,12 +17,18 @@ type Report struct {
 	JiraComponentID *big.Rat   `json:"jira_component_id"`
 	TestName        string     `json:"test_name"`
 	GeneratedAt     *time.Time `json:"generated_at"`
+	// Lifecycle is the test's lifecycle value from BigQuery (e.g. "blocking", "informing").
+	// Defaults to "blocking" when unset in the source data.
+	Lifecycle string `json:"lifecycle,omitempty"`
 
 	// Analyses is a list of potentially multiple analysis runs for this test.
 	// Callers can assume that the first in the list is somewhat authoritative, and should
 	// be displayed by default, but each analysis offers details and explanations on its outcome
 	// and can be used in some capacity.
 	Analyses []Analysis `json:"analyses"`
+
+	// Links contains HATEOAS-style links for this report (not stored in database)
+	Links map[string]string `json:"links,omitempty"`
 }
 
 // Analysis is a collection of stats for the report which could potentially carry
@@ -56,9 +61,6 @@ type TestComparison struct {
 
 	// PityAdjustment can be used to adjust the tolerance for failures for this particular test.
 	PityAdjustment float64 `json:"-"`
-
-	// MinimumFailureAdjustment can be used to adjust the tolerance for minimum number of failures for this particular test.
-	MinimumFailureAdjustment int `json:"-"`
 
 	// RequiredPassRateAdjustment can be used to adjust the tolerance for failures for a new test.
 	RequiredPassRateAdjustment float64 `json:"-"`
@@ -101,11 +103,14 @@ type JobStats struct {
 }
 
 type JobRunStats struct {
-	JobURL    string         `json:"job_url"`
-	JobRunID  string         `json:"job_run_id"`
-	StartTime civil.DateTime `json:"start_time"`
+	JobURL    string    `json:"job_url"`
+	JobRunID  string    `json:"job_run_id"`
+	StartTime time.Time `json:"start_time"`
 	// TestStats is the test stats from one particular job run.
 	// For the majority of the tests, there is only one junit. But
 	// there are cases multiple junits are generated for the same test.
-	TestStats crtest.Stats `json:"test_stats"`
+	TestStats    crtest.Stats `json:"test_stats"`
+	JobLabels    []string     `json:"job_labels,omitempty"`
+	JobSymptoms  []string     `json:"job_symptoms,omitempty"`
+	TestFailures int          `json:"test_failures"`
 }

@@ -3,6 +3,7 @@ import { DataGrid } from '@mui/x-data-grid'
 import { Link, useNavigate } from 'react-router-dom'
 import { NumberParam, StringParam, useQueryParam } from 'use-query-params'
 import {
+  parseVersion,
   pathForTestSubstringByVariant,
   safeEncodeURIComponent,
   SafeJSONParam,
@@ -19,30 +20,52 @@ import SimpleBreadcrumbs from '../components/SimpleBreadcrumbs'
 export default function FeatureGates(props) {
   const navigate = useNavigate()
 
-  const { classes } = props
+  const { release, releases } = props
   const [fetchError, setFetchError] = React.useState('')
   const [isLoaded, setLoaded] = React.useState(false)
   const [rows, setRows] = React.useState([])
 
+  // Walk two releases back for comparison, but only if those releases had feature gates
+  function walkBackForFGLimits(release, releases) {
+    if (!release || !releases?.release_attrs) return []
+    let fgLimit = releases.release_attrs[release]
+    if (!fgLimit) return []
+
+    for (let i = 0; i < 2; i++) {
+      let prev = fgLimit.previous_release
+      if (!prev) break
+      prev = releases.release_attrs[prev]
+      if (!prev || !prev.capabilities?.featureGates) break
+      fgLimit = prev
+    }
+
+    const { major, minor } = parseVersion(fgLimit.name)
+    if (!major) return [] // version filters only work with "X.Y" style releases
+
+    return [String(major), String(minor)]
+  }
+
   const defaultFilterModel = React.useMemo(() => {
-    if (!props.release) return { items: [] }
-
-    const [major, minor] = props.release.split('.').map(Number)
-
-    return {
+    let filterItems = {
       items: [
         {
           columnField: 'enabled',
           not: true,
-          operatorValue: 'contains',
+          operatorValue: 'has entry containing',
           value: 'Default:Hypershift',
         },
         {
           columnField: 'enabled',
           not: true,
-          operatorValue: 'contains',
+          operatorValue: 'has entry containing',
           value: 'Default:SelfManagedHA',
         },
+      ],
+    }
+
+    const [major, minor] = walkBackForFGLimits(release, releases)
+    if (major) {
+      filterItems.items.push(
         {
           columnField: 'first_seen_in_major',
           operatorValue: '=',
@@ -51,42 +74,47 @@ export default function FeatureGates(props) {
         {
           columnField: 'first_seen_in_minor',
           operatorValue: '>=',
-          value: String(Math.max(minor - 2, 15)), // don't go below 4.15
-        },
-      ],
+          value: String(minor),
+        }
+      )
     }
-  }, [props.release])
+    return filterItems
+  }, [props.release, props.releases])
 
   const staleFeatureGates = React.useMemo(() => {
     if (!props.release) return []
-
-    const [major, minor] = props.release.split('.').map(Number)
-
-    return [
+    let filterItems = [
       {
         columnField: 'enabled',
         not: true,
-        operatorValue: 'contains',
+        operatorValue: 'has entry containing',
         value: 'Default:Hypershift',
       },
       {
         columnField: 'enabled',
         not: true,
-        operatorValue: 'contains',
+        operatorValue: 'has entry containing',
         value: 'Default:SelfManagedHA',
       },
-      {
-        columnField: 'first_seen_in_major',
-        operatorValue: '=',
-        value: String(major),
-      },
-      {
-        columnField: 'first_seen_in_minor',
-        operatorValue: '<=',
-        value: String(Math.max(minor - 2, 15)),
-      },
     ]
-  }, [props.release])
+
+    const [major, minor] = walkBackForFGLimits(release, releases)
+    if (major) {
+      filterItems.push(
+        {
+          columnField: 'first_seen_in_major',
+          operatorValue: '=',
+          value: String(major),
+        },
+        {
+          columnField: 'first_seen_in_minor',
+          operatorValue: '<=',
+          value: String(minor),
+        }
+      )
+    }
+    return filterItems
+  }, [props.release, props.releases])
 
   const [filterModel = defaultFilterModel, setFilterModel] = useQueryParam(
     'filters',
@@ -107,7 +135,7 @@ export default function FeatureGates(props) {
       model: [
         {
           columnField: 'enabled',
-          operatorValue: 'contains',
+          operatorValue: 'has entry',
           value: 'Default:Hypershift',
         },
       ],
@@ -117,7 +145,7 @@ export default function FeatureGates(props) {
       model: [
         {
           columnField: 'enabled',
-          operatorValue: 'contains',
+          operatorValue: 'has entry',
           value: 'Default:SelfManagedHA',
         },
       ],
@@ -127,13 +155,13 @@ export default function FeatureGates(props) {
       model: [
         {
           columnField: 'enabled',
-          operatorValue: 'contains',
+          operatorValue: 'has entry',
           value: 'TechPreviewNoUpgrade:SelfManagedHA',
         },
         {
           columnField: 'enabled',
           not: true,
-          operatorValue: 'contains',
+          operatorValue: 'has entry',
           value: 'Default:SelfManagedHA',
         },
       ],
@@ -143,13 +171,13 @@ export default function FeatureGates(props) {
       model: [
         {
           columnField: 'enabled',
-          operatorValue: 'contains',
+          operatorValue: 'has entry',
           value: 'TechPreviewNoUpgrade:Hypershift',
         },
         {
           columnField: 'enabled',
           not: true,
-          operatorValue: 'contains',
+          operatorValue: 'has entry',
           value: 'Default:Hypershift',
         },
       ],
@@ -274,6 +302,9 @@ export default function FeatureGates(props) {
   }
 
   const fetchData = () => {
+    setLoaded(false)
+    setRows([])
+
     let queryString = ''
     if (filterModel && filterModel.items.length > 0) {
       queryString +=
@@ -316,10 +347,6 @@ export default function FeatureGates(props) {
   }
 
   useEffect(() => {
-    setLoaded(false)
-  }, [filterModel])
-
-  useEffect(() => {
     fetchData()
     document.title = `Sippy > ${props.release} > Feature Gates`
   }, [filterModel, sort, sortField])
@@ -340,53 +367,50 @@ export default function FeatureGates(props) {
             {fetchError}
           </Typography>
         )}
-        {isLoaded ? (
-          <DataGrid
-            components={{ Toolbar: GridToolbar }}
-            rows={rows}
-            columns={columns}
-            getRowHeight={() => 'auto'}
-            autoHeight={true}
-            rowsPerPageOptions={[10, 25, 50]}
-            sortModel={[
-              {
-                field: sortField,
-                sort: sort,
+        <DataGrid
+          loading={!isLoaded}
+          components={{ Toolbar: GridToolbar }}
+          rows={rows}
+          columns={columns}
+          getRowHeight={() => 'auto'}
+          autoHeight={true}
+          rowsPerPageOptions={[10, 25, 50]}
+          sortModel={[
+            {
+              field: sortField,
+              sort: sort,
+            },
+          ]}
+          pageSize={pageSize}
+          onPageSizeChange={(newPageSize) => setPageSize(newPageSize)}
+          sortingOrder={['desc', 'asc']}
+          filterMode="server"
+          sortingMode="server"
+          onSortModelChange={(m) => updateSortModel(m)}
+          sx={{
+            '& .MuiDataGrid-row:hover': {
+              cursor: 'pointer',
+            },
+          }}
+          disableSelectionOnClick
+          filterModel={filterModel}
+          onRowClick={onRowClick}
+          componentsProps={{
+            toolbar: {
+              bookmarks: bookmarks,
+              columns: columns,
+              clearSearch: () => requestSearch(''),
+              doSearch: requestSearch,
+              addFilters: (m) => addFilters(m),
+              filterModel: filterModel,
+              setFilterModel: setFilterModel,
+              downloadDataFunc: () => {
+                return rows
               },
-            ]}
-            pageSize={pageSize}
-            onPageSizeChange={(newPageSize) => setPageSize(newPageSize)}
-            sortingOrder={['desc', 'asc']}
-            filterMode="server"
-            sortingMode="server"
-            onSortModelChange={(m) => updateSortModel(m)}
-            sx={{
-              '& .MuiDataGrid-row:hover': {
-                cursor: 'pointer', // Change cursor on hover
-              },
-            }}
-            disableSelectionOnClick
-            filterModel={filterModel}
-            onRowClick={onRowClick}
-            componentsProps={{
-              toolbar: {
-                bookmarks: bookmarks,
-                columns: columns,
-                clearSearch: () => requestSearch(''),
-                doSearch: requestSearch,
-                addFilters: (m) => addFilters(m),
-                filterModel: filterModel,
-                setFilterModel: setFilterModel,
-                downloadDataFunc: () => {
-                  return rows
-                },
-                downloadFilePrefix: 'feature-gates',
-              },
-            }}
-          />
-        ) : (
-          <Typography align="center">Loading...</Typography>
-        )}
+              downloadFilePrefix: 'feature-gates',
+            },
+          }}
+        />
       </Container>
     </Fragment>
   )
@@ -402,6 +426,7 @@ FeatureGates.defaultProps = {
 FeatureGates.propTypes = {
   classes: PropTypes.object,
   release: PropTypes.string.isRequired,
+  releases: PropTypes.object.isRequired,
   pageSize: PropTypes.number,
   sort: PropTypes.string,
   sortField: PropTypes.string,

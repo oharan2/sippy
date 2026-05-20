@@ -17,7 +17,7 @@ type ProwJob struct {
 
 	Kind        ProwKind
 	Name        string         `gorm:"unique"`
-	Release     string         `gorm:"varchar(10)"`
+	Release     string         `gorm:"index"`
 	Variants    pq.StringArray `gorm:"type:text[];index:idx_prow_jobs_variants,type:gin"`
 	TestGridURL string
 	// Bugs maps to all the bugs we scanned and found this prowjob name mentioned in the description or any comment.
@@ -39,6 +39,8 @@ type ProwJobRun struct {
 	// ProwJob is a link to the prow job this run belongs to.
 	ProwJob   ProwJob
 	ProwJobID uint `gorm:"index"`
+	// Used for partitioning
+	ProwJobRelease string
 
 	// Cluster is the cluster where the prow job was run.
 	Cluster string
@@ -46,8 +48,9 @@ type ProwJobRun struct {
 	GCSBucket    string
 	URL          string
 	TestFailures int
-	Tests        []ProwJobRunTest  `gorm:"constraint:OnDelete:CASCADE;"`
-	PullRequests []ProwPullRequest `gorm:"many2many:prow_job_run_prow_pull_requests;constraint:OnDelete:CASCADE;"`
+	Tests        []ProwJobRunTest       `gorm:"constraint:OnDelete:CASCADE;"`
+	PullRequests []ProwPullRequest      `gorm:"many2many:prow_job_run_prow_pull_requests;constraint:OnDelete:CASCADE;"`
+	Annotations  []ProwJobRunAnnotation `gorm:"constraint:OnDelete:CASCADE;"`
 	Failed       bool
 	// InfrastructureFailure is true if the job run failed, for reasons which appear to be related to test/CI infra.
 	InfrastructureFailure bool
@@ -57,9 +60,32 @@ type ProwJobRun struct {
 	Timestamp     time.Time `gorm:"index;index:idx_prow_job_runs_timestamp_date,expression:DATE(timestamp AT TIME ZONE 'UTC')"`
 	Duration      time.Duration
 	OverallResult v1.JobOverallResult `gorm:"index"`
+	// Labels stores the IDs of labels applied to this job run
+	// This is populated from symptom detection or manual annotation
+	Labels pq.StringArray `gorm:"type:text[];index:idx_prow_job_runs_labels,type:gin" json:"labels"`
 	// used to pass the TestCount in via the api, we have the actual tests in the db and can calculate it here so don't persist
 	TestCount   int         `gorm:"-"`
 	ClusterData ClusterData `gorm:"-"`
+}
+
+// ProwJobRunProwPullRequest is the explicit join table for the many-to-many relationship
+// between ProwJobRun and ProwPullRequest. Release and timestamp are denormalized from
+// ProwJobRun to support future partitioning.
+type ProwJobRunProwPullRequest struct {
+	ProwJobRunID        uint `gorm:"primaryKey"`
+	ProwPullRequestID   uint `gorm:"primaryKey"`
+	ProwJobRunRelease   string
+	ProwJobRunTimestamp time.Time
+}
+
+// ProwJobRunAnnotation stores a single key-value annotation for a ProwJobRun.
+type ProwJobRunAnnotation struct {
+	gorm.Model
+	ProwJobRunID        uint   `gorm:"index;uniqueIndex:idx_prow_job_run_annotations_key"`
+	Key                 string `gorm:"uniqueIndex:idx_prow_job_run_annotations_key"`
+	Value               string
+	ProwJobRunRelease   string
+	ProwJobRunTimestamp time.Time
 }
 
 type Test struct {
@@ -75,12 +101,19 @@ type ProwJobRunTest struct {
 	gorm.Model
 	ProwJobRunID uint `gorm:"index"`
 	ProwJobRun   ProwJobRun
-	TestID       uint `gorm:"index"`
-	Test         Test
+	// used for variants
+	// skips joining on ProwJobRunID just to get ProwJobID
+	ProwJobID uint
+	// used for partitioning
+	ProwJobRunTimestamp time.Time
+	// used for partitioning
+	ProwJobRunRelease string
+	TestID            uint `gorm:"index;index:idx_prow_job_run_tests_test_id_status"`
+	Test              Test
 	// SuiteID may be nil if no suite name could be parsed from the testgrid test name.
 	SuiteID   *uint `gorm:"index"`
 	Suite     Suite
-	Status    int `gorm:"index"`
+	Status    int `gorm:"index;index:idx_prow_job_run_tests_test_id_status"`
 	Duration  float64
 	CreatedAt time.Time `gorm:"index"`
 	DeletedAt gorm.DeletedAt
@@ -95,6 +128,10 @@ type ProwJobRunTestOutput struct {
 	ProwJobRunTestID uint `gorm:"index"`
 	// Output stores the output of a ProwJobRunTest.
 	Output string
+	// used for partitioning
+	ProwJobRunTestTimestamp time.Time
+	// used for partitioning
+	ProwJobRunTestRelease string
 }
 
 // Suite defines a junit testsuite. Used to differentiate the same test being run in different suites in ProwJobRunTest.

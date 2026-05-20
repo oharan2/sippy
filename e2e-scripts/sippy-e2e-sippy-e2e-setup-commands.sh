@@ -194,22 +194,68 @@ ${KUBECTL_CMD} -n sippy-e2e wait --for=condition=Ready pod/postg1 --timeout=${TI
 postgres_retVal=$?
 ${KUBECTL_CMD} -n sippy-e2e wait --for=condition=Ready pod/redis1 --timeout=${TIMEOUT}
 redis_retVal=$?
-set -e
+
 echo
+echo "=== Pod status ==="
+${KUBECTL_CMD} -n sippy-e2e get po -o wide
+echo
+
 echo "Saving postgres logs ..."
-${KUBECTL_CMD} -n sippy-e2e logs postg1 > ${ARTIFACT_DIR}/postgres.log
+${KUBECTL_CMD} -n sippy-e2e logs postg1 > ${ARTIFACT_DIR}/postgres.log 2>&1
 echo "Saving redis logs ..."
-${KUBECTL_CMD} -n sippy-e2e logs redis1 > ${ARTIFACT_DIR}/redis.log
+${KUBECTL_CMD} -n sippy-e2e logs redis1 > ${ARTIFACT_DIR}/redis.log 2>&1
+
+if [ ${postgres_retVal} -ne 0 ] || [ ${redis_retVal} -ne 0 ]; then
+  echo
+  echo "=== FAILURE DIAGNOSTICS ==="
+  echo
+
+  echo "=== Pod descriptions ==="
+  ${KUBECTL_CMD} -n sippy-e2e describe pod/postg1
+  echo "---"
+  ${KUBECTL_CMD} -n sippy-e2e describe pod/redis1
+  echo
+
+  echo "=== Namespace events (sorted by time) ==="
+  ${KUBECTL_CMD} -n sippy-e2e get events --sort-by='.lastTimestamp'
+  echo
+
+  echo "=== Pod conditions ==="
+  ${KUBECTL_CMD} -n sippy-e2e get pod postg1 -o jsonpath='{range .status.conditions[*]}{.type}={.status} reason={.reason} message={.message}{"\n"}{end}' 2>/dev/null
+  echo "---"
+  ${KUBECTL_CMD} -n sippy-e2e get pod redis1 -o jsonpath='{range .status.conditions[*]}{.type}={.status} reason={.reason} message={.message}{"\n"}{end}' 2>/dev/null
+  echo
+
+  echo "=== Container statuses ==="
+  ${KUBECTL_CMD} -n sippy-e2e get pod postg1 -o jsonpath='{range .status.containerStatuses[*]}name={.name} ready={.ready} state={.state}{"\n"}{end}' 2>/dev/null
+  echo "---"
+  ${KUBECTL_CMD} -n sippy-e2e get pod redis1 -o jsonpath='{range .status.containerStatuses[*]}name={.name} ready={.ready} state={.state}{"\n"}{end}' 2>/dev/null
+  echo
+
+  echo "=== Node status for scheduled nodes ==="
+  postg1_node=$(${KUBECTL_CMD} -n sippy-e2e get pod postg1 -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+  redis1_node=$(${KUBECTL_CMD} -n sippy-e2e get pod redis1 -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+  for node in ${postg1_node} ${redis1_node}; do
+    if [ -n "${node}" ]; then
+      echo "Node ${node} conditions:"
+      ${KUBECTL_CMD} get node ${node} -o jsonpath='{range .status.conditions[*]}  {.type}={.status} message={.message}{"\n"}{end}' 2>/dev/null
+    fi
+  done
+  echo
+
+  echo "=== END FAILURE DIAGNOSTICS ==="
+fi
+set -e
+
 if [ ${postgres_retVal} -ne 0 ]; then
-  echo "Postgres pod never came up"
+  echo "ERROR: Postgres pod never became Ready (timed out after ${TIMEOUT})"
   exit 1
 fi
 if [ ${redis_retVal} -ne 0 ]; then
-  echo "Redis pod never came up"
+  echo "ERROR: Redis pod never became Ready (timed out after ${TIMEOUT})"
   exit 1
 fi
 
-${KUBECTL_CMD} -n sippy-e2e get po -o wide
 ${KUBECTL_CMD} -n sippy-e2e get svc,ep
 
 # Get the gcs credentials out to the cluster-pool cluster.
@@ -222,12 +268,28 @@ ${KUBECTL_CMD} create secret generic gcs-cred --from-file gcs-cred=$GCS_CRED -n 
 # Get the registry credentials for all build farm clusters out to the cluster-pool cluster.
 ${KUBECTL_CMD} -n sippy-e2e create secret generic regcred --from-file=.dockerconfigjson=${DOCKERCONFIGJSON} --type=kubernetes.io/dockerconfigjson
 
-# Make the "sippy loader" pod.
+# Create a PVC for coverage data that outlives the server pod.
+cat << END | ${KUBECTL_CMD} apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sippy-coverage
+  namespace: sippy-e2e
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Mi
+END
+
+# Seed the database with synthetic data for e2e tests.
+# TODO: Add a scoped 'sippy load' test back (e.g. single job) to exercise the GCS loading path.
 cat << END | ${KUBECTL_CMD} apply -f -
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: sippy-load-job
+  name: sippy-seed-job
   namespace: sippy-e2e
 spec:
   template:
@@ -238,25 +300,14 @@ spec:
         imagePullPolicy: ${SIPPY_IMAGE_PULL_POLICY:-Always}
         resources:
           limits:
-            memory: 3G
+            memory: 8G
         terminationMessagePath: /dev/termination-log
         terminationMessagePolicy: File
         command:  ["/bin/sh", "-c"]
         args:
-          - /bin/sippy load --init-database --log-level=debug --release 4.14 --database-dsn=postgresql://postgres:password@postgres.sippy-e2e.svc.cluster.local:5432/postgres --redis-url=redis://redis.sippy-e2e.svc.cluster.local:6379 --mode=ocp --config ./config/e2e-openshift.yaml --google-service-account-credential-file /tmp/secrets/gcs-cred
-        env:
-        - name: GCS_SA_JSON_PATH
-          value: /tmp/secrets/gcs-cred
-        volumeMounts:
-        - mountPath: /tmp/secrets
-          name: gcs-cred
-          readOnly: true
+          - /bin/sippy seed-data --init-database --log-level=debug --database-dsn=postgresql://postgres:password@postgres.sippy-e2e.svc.cluster.local:5432/postgres
       imagePullSecrets:
       - name: regcred
-      volumes:
-        - name: gcs-cred
-          secret:
-            secretName: gcs-cred
       dnsPolicy: ClusterFirst
       restartPolicy: Never
       schedulerName: default-scheduler
@@ -266,23 +317,28 @@ spec:
 END
 
 date
-echo "Waiting for sippy loader job to finish ..."
-${KUBECTL_CMD} -n sippy-e2e get job sippy-load-job
-${KUBECTL_CMD} -n sippy-e2e describe job sippy-load-job
+echo "Waiting for sippy seed job to finish ..."
+${KUBECTL_CMD} -n sippy-e2e get job sippy-seed-job
 
-# We set +e to avoid the script aborting before we can retrieve logs.
 set +e
-
-echo "Waiting up to ${SIPPY_LOAD_TIMEOUT:=1200s} for the sippy-load-job to complete..."
-${KUBECTL_CMD} -n sippy-e2e wait --for=condition=complete job/sippy-load-job --timeout ${SIPPY_LOAD_TIMEOUT}
-retVal=$?
+echo "Waiting up to 300s for the sippy-seed-job to complete..."
+${KUBECTL_CMD} -n sippy-e2e wait --for=condition=complete job/sippy-seed-job --timeout 300s
+seedRetVal=$?
 set -e
 
-job_pod=$(${KUBECTL_CMD} -n sippy-e2e get pod --selector=job-name=sippy-load-job --output=jsonpath='{.items[0].metadata.name}')
-${KUBECTL_CMD} -n sippy-e2e logs ${job_pod} > ${ARTIFACT_DIR}/sippy-load.log
+seed_pod=$(${KUBECTL_CMD} -n sippy-e2e get pod --selector=job-name=sippy-seed-job --output=jsonpath='{.items[0].metadata.name}')
+${KUBECTL_CMD} -n sippy-e2e logs ${seed_pod} > ${ARTIFACT_DIR}/sippy-seed.log 2>&1
 
-if [ ${retVal} -ne 0 ]; then
-  echo "sippy loading never finished on time."
+if [ ${seedRetVal} -ne 0 ]; then
+  echo
+  echo "=== SIPPY SEED JOB FAILURE DIAGNOSTICS ==="
+  echo "=== Job status ==="
+  ${KUBECTL_CMD} -n sippy-e2e describe job sippy-seed-job
+  echo "=== Job pod status ==="
+  ${KUBECTL_CMD} -n sippy-e2e describe pod ${seed_pod}
+  echo "=== END SIPPY SEED JOB FAILURE DIAGNOSTICS ==="
+  echo
+  echo "ERROR: sippy-seed-job did not complete within 300s"
   exit 1
 fi
 

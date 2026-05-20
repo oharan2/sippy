@@ -1,5 +1,7 @@
-.claude
+.playwright-mcp/
+.claude/*local.json
 /*.json
+!.mcp.json
 report.sh
 /sippy
 /sippy-daemon
@@ -7,3 +9,16 @@ report.sh
 .vscode/
 .idea/
 /sippy-ng/build/*
+.env
+.devcontainer/.env
+*.log
+sippy-dev-logs/
+mcp/.venv/
+__pycache__/
+*.py[cod]
+e2e-coverage*
+junit.xml
+
+
+# APM dependencies
+apm_modules/

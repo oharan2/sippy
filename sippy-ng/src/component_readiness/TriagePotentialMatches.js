@@ -96,54 +96,65 @@ export default function TriagePotentialMatches({
   const [selectedRegressions, setSelectedRegressions] = React.useState([])
   const [isLinking, setIsLinking] = React.useState(false)
   const [filterSimilarNames, setFilterSimilarNames] = React.useState(true)
-  const [filterSameLastFailures, setFilterSameLastFailures] =
+  const [filterOverlappingJobRuns, setFilterOverlappingJobRuns] =
     React.useState(true)
-  const { expandEnvironment } = useContext(CompReadyVarsContext)
+  const [filterAlreadyTriaged, setFilterAlreadyTriaged] = React.useState(false)
+  const { expandEnvironment, view } = useContext(CompReadyVarsContext)
 
   const [autoOpenMatches, setAutoOpenMatches] = useQueryParam(
     'openMatches',
     BooleanParam
   )
 
-  // Extract and sort views from triage regressions by frequency
+  // Extract unique active view names from triage regressions; default to first, preferring -main views
   React.useEffect(() => {
-    if (triage.regressions && triage.regressions.length > 0) {
-      const viewCounts = {}
-      triage.regressions.forEach((regression) => {
-        if (regression.view) {
-          viewCounts[regression.view] = (viewCounts[regression.view] || 0) + 1
-        }
-      })
+    if (!triage.regressions || triage.regressions.length === 0) return
 
-      const sortedViews = Object.entries(viewCounts)
-        .sort(([, a], [, b]) => b - a) // Sort by frequency descending
-        .map(([view]) => view)
-
-      setAvailableViews(sortedViews)
-
-      // Set default to the most frequent view
-      if (sortedViews.length > 0 && !selectedView) {
-        setSelectedView(sortedViews[0])
+    const viewSet = new Set()
+    triage.regressions.forEach((regression) => {
+      if (regression.views) {
+        regression.views.forEach((rv) => {
+          if (rv.active) viewSet.add(rv.view_name)
+        })
       }
+    })
+
+    const views = [...viewSet].sort((a, b) => {
+      const aMain = a.endsWith('-main')
+      const bMain = b.endsWith('-main')
+      if (aMain && !bMain) return -1
+      if (!aMain && bMain) return 1
+      return a.localeCompare(b)
+    })
+    setAvailableViews(views)
+
+    if (views.length === 0) {
+      setSelectedView('')
+    } else if (!selectedView || !views.includes(selectedView)) {
+      setSelectedView(views[0])
     }
-  }, [triage.regressions])
+  }, [triage.regressions, selectedView])
 
   React.useEffect(() => {
-    if (autoOpenMatches === true) {
+    if (autoOpenMatches === true && selectedView !== '') {
       findPotentialMatches()
     }
-  }, [autoOpenMatches])
+  }, [autoOpenMatches, selectedView])
 
   React.useEffect(() => {
     if (selectedView !== '' && isModalOpen) {
       findPotentialMatches()
     }
-  }, [selectedView])
+  }, [selectedView, isModalOpen])
 
   const findPotentialMatches = () => {
     setIsLoading(true)
     setIsModalOpen(true)
-    fetch(`${triage.links.potential_matches}?view=${selectedView}`)
+    fetch(
+      `${triage.links.potential_matches}?view=${encodeURIComponent(
+        selectedView
+      )}`
+    )
       .then((response) => {
         if (response.status !== 200) {
           throw new Error('API server returned ' + response.status)
@@ -152,10 +163,16 @@ export default function TriagePotentialMatches({
       })
       .then((matches) => {
         console.log('Potential matching regressions:', matches)
-        setPotentialMatches(matches || [])
+        if (matches && matches.length > 0) {
+          const sortedMatches = matches.sort(
+            (a, b) => b.confidence_level - a.confidence_level
+          )
+          setPotentialMatches(sortedMatches || [])
+        }
         setSelectedRegressions([])
         setFilterSimilarNames(true)
-        setFilterSameLastFailures(true)
+        setFilterOverlappingJobRuns(true)
+        setFilterAlreadyTriaged(false)
         setIsModalOpen(true)
       })
       .catch((error) => {
@@ -208,29 +225,45 @@ export default function TriagePotentialMatches({
   }
 
   const filteredMatches = React.useMemo(() => {
-    if (filterSimilarNames && filterSameLastFailures) {
-      return potentialMatches
+    let matches = potentialMatches
+
+    // Filter out matches already triaged (unless filter is enabled)
+    if (!filterAlreadyTriaged) {
+      matches = matches.filter((match) => {
+        const triages = match.regressed_test?.regression?.triages || []
+        return triages.length === 0
+      })
     }
 
-    return potentialMatches.filter((match) => {
+    // Apply similarity filters
+    if (filterSimilarNames && filterOverlappingJobRuns) {
+      return matches
+    }
+
+    return matches.filter((match) => {
       const hasSimilarNames =
         match.similarly_named_tests && match.similarly_named_tests.length > 0
-      const hasSameLastFailures =
-        match.same_last_failures && match.same_last_failures.length > 0
+      const hasOverlappingJobRuns =
+        match.overlapping_job_runs && match.overlapping_job_runs.length > 0
 
-      if (!filterSimilarNames && !filterSameLastFailures) {
+      if (!filterSimilarNames && !filterOverlappingJobRuns) {
         return false
       }
-      if (filterSimilarNames && !filterSameLastFailures) {
+      if (filterSimilarNames && !filterOverlappingJobRuns) {
         return hasSimilarNames
       }
-      if (!filterSimilarNames && filterSameLastFailures) {
-        return hasSameLastFailures
+      if (!filterSimilarNames && filterOverlappingJobRuns) {
+        return hasOverlappingJobRuns
       }
 
       return false
     })
-  }, [potentialMatches, filterSimilarNames, filterSameLastFailures])
+  }, [
+    potentialMatches,
+    filterSimilarNames,
+    filterOverlappingJobRuns,
+    filterAlreadyTriaged,
+  ])
 
   const columns = [
     {
@@ -328,7 +361,8 @@ export default function TriagePotentialMatches({
         const testDetailsUrl = generateTestDetailsReportLink(
           regressedTest,
           filterVals,
-          expandEnvironment
+          expandEnvironment,
+          viewToUse
         )
 
         return {
@@ -353,7 +387,7 @@ export default function TriagePotentialMatches({
       headerName: (
         <Tooltip
           title={
-            'Confidence Level (0-10) - Higher values indicate higher likelihood of matching based on: Similar test names (edit distance scoring), Same last failure times (fails in the same job runs)'
+            'Confidence Level (1-10) - Higher values indicate higher likelihood of matching based on: Overlapping failed job runs (shared prow job runs between regressions), Similar test names (edit distance scoring)'
           }
           arrow
           placement="top"
@@ -367,15 +401,18 @@ export default function TriagePotentialMatches({
         const similarlyNamedCount = row.similarly_named_tests
           ? row.similarly_named_tests.length
           : 0
-        const sameLastFailureCount = row.same_last_failures
-          ? row.same_last_failures.length
+        const sharedJobRunCount = row.overlapping_job_runs
+          ? row.overlapping_job_runs.reduce(
+              (sum, o) => sum + (o.shared_job_run_ids?.length || 0),
+              0
+            )
           : 0
 
         const tooltipContent = (
           <div>
             <div>Match Breakdown:</div>
             <div>• Similarly Named Tests: {similarlyNamedCount}</div>
-            <div>• Same Last Failure: {sameLastFailureCount}</div>
+            <div>• Shared Job Runs: {sharedJobRunCount}</div>
           </div>
         )
 
@@ -394,7 +431,7 @@ export default function TriagePotentialMatches({
         onClick={findPotentialMatches}
         variant="contained"
         color="primary"
-        sx={{ marginTop: '10px' }}
+        sx={{ margin: '10px 0' }}
         disabled={isLoading}
       >
         {isLoading
@@ -431,7 +468,7 @@ export default function TriagePotentialMatches({
           ) : (
             <>
               <div className={classes.filterContainer}>
-                <div>
+                <div className={classes.filterSection}>
                   <FormControl size="small" className={classes.viewDropdown}>
                     <InputLabel>View</InputLabel>
                     <Select
@@ -473,15 +510,31 @@ export default function TriagePotentialMatches({
                     <FormControlLabel
                       control={
                         <Checkbox
-                          checked={filterSameLastFailures}
+                          checked={filterOverlappingJobRuns}
                           onChange={(e) =>
-                            setFilterSameLastFailures(e.target.checked)
+                            setFilterOverlappingJobRuns(e.target.checked)
                           }
                         />
                       }
-                      label={`Same Last Failures (${
+                      label={`Overlapping Job Runs (${
                         potentialMatches.filter(
-                          (m) => m.same_last_failures?.length > 0
+                          (m) => m.overlapping_job_runs?.length > 0
+                        ).length
+                      })`}
+                    />
+                    <FormControlLabel
+                      control={
+                        <Checkbox
+                          checked={filterAlreadyTriaged}
+                          onChange={(e) =>
+                            setFilterAlreadyTriaged(e.target.checked)
+                          }
+                        />
+                      }
+                      label={`Already Triaged (${
+                        potentialMatches.filter(
+                          (m) =>
+                            m.regressed_test?.regression?.triages?.length > 0
                         ).length
                       })`}
                     />

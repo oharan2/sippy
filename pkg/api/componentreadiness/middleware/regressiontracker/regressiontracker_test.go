@@ -72,8 +72,7 @@ func TestRegressionTracker_PostAnalysis(t *testing.T) {
 			},
 			openRegression: models.TestRegression{
 				ID:       0,
-				View:     "",
-				Release:  "",
+				Release:  sampleRelease,
 				TestID:   testKey.TestID,
 				TestName: testKey.TestName,
 				Variants: variantsStrSlice,
@@ -118,8 +117,7 @@ func TestRegressionTracker_PostAnalysis(t *testing.T) {
 			},
 			openRegression: models.TestRegression{
 				ID:       0,
-				View:     "",
-				Release:  "",
+				Release:  sampleRelease,
 				TestID:   testKey.TestID,
 				TestName: testKey.TestName,
 				Variants: variantsStrSlice,
@@ -170,8 +168,7 @@ func TestRegressionTracker_PostAnalysis(t *testing.T) {
 			},
 			openRegression: models.TestRegression{
 				ID:       0,
-				View:     "",
-				Release:  "",
+				Release:  sampleRelease,
 				TestID:   testKey.TestID,
 				TestName: testKey.TestName,
 				Variants: variantsStrSlice,
@@ -222,8 +219,7 @@ func TestRegressionTracker_PostAnalysis(t *testing.T) {
 			},
 			openRegression: models.TestRegression{
 				ID:       0,
-				View:     "",
-				Release:  "",
+				Release:  sampleRelease,
 				TestID:   testKey.TestID,
 				TestName: testKey.TestName,
 				Variants: variantsStrSlice,
@@ -260,8 +256,7 @@ func TestRegressionTracker_PostAnalysis(t *testing.T) {
 			},
 			openRegression: models.TestRegression{
 				ID:       0,
-				View:     "",
-				Release:  "",
+				Release:  sampleRelease,
 				TestID:   testKey.TestID,
 				TestName: testKey.TestName,
 				Variants: variantsStrSlice,
@@ -325,25 +320,22 @@ func TestRegressionTracker_PreAnalysis_Adjustments(t *testing.T) {
 	variantsStrSlice := utils.VariantsMapToStringSlice(testKey.Variants)
 
 	tests := []struct {
-		name                         string
-		hasOpenRegression            bool
-		expectedPityAdjustment       float64
-		expectedMinFailureAdjustment int
-		expectedRequiredConfidence   int
+		name                       string
+		hasOpenRegression          bool
+		expectedPityAdjustment     float64
+		expectedRequiredConfidence int
 	}{
 		{
-			name:                         "no open regression - no adjustments",
-			hasOpenRegression:            false,
-			expectedPityAdjustment:       0,
-			expectedMinFailureAdjustment: 0,
-			expectedRequiredConfidence:   95, // default confidence
+			name:                       "no open regression - no adjustments",
+			hasOpenRegression:          false,
+			expectedPityAdjustment:     0,
+			expectedRequiredConfidence: 95, // default confidence
 		},
 		{
-			name:                         "has open regression - adjustments applied",
-			hasOpenRegression:            true,
-			expectedPityAdjustment:       openRegressionPityAdjustment,            // -2
-			expectedMinFailureAdjustment: openRegressionMinimumFailureAdjustment,  // -1
-			expectedRequiredConfidence:   95 - openRegressionConfidenceAdjustment, // 90
+			name:                       "has open regression - adjustments applied",
+			hasOpenRegression:          true,
+			expectedPityAdjustment:     openRegressionPityAdjustment,            // -2
+			expectedRequiredConfidence: 95 - openRegressionConfidenceAdjustment, // 90
 		},
 	}
 
@@ -370,17 +362,15 @@ func TestRegressionTracker_PreAnalysis_Adjustments(t *testing.T) {
 
 			// Set up test stats
 			testStats := &testdetails.TestComparison{
-				ReportStatus:             crtest.SignificantRegression,
-				RequiredConfidence:       95,
-				PityAdjustment:           0,
-				MinimumFailureAdjustment: 0,
+				ReportStatus:       crtest.SignificantRegression,
+				RequiredConfidence: 95,
+				PityAdjustment:     0,
 			}
 
 			// Set up open regressions if needed
 			if tt.hasOpenRegression {
 				openRegression := &models.TestRegression{
 					ID:       1,
-					View:     "test-view",
 					Release:  sampleRelease,
 					TestID:   testKey.TestID,
 					TestName: testKey.TestName,
@@ -402,8 +392,6 @@ func TestRegressionTracker_PreAnalysis_Adjustments(t *testing.T) {
 			// Verify adjustments
 			assert.Equal(t, tt.expectedPityAdjustment, testStats.PityAdjustment,
 				"PityAdjustment should match expected value")
-			assert.Equal(t, tt.expectedMinFailureAdjustment, testStats.MinimumFailureAdjustment,
-				"MinimumFailureAdjustment should match expected value")
 			assert.Equal(t, tt.expectedRequiredConfidence, testStats.RequiredConfidence,
 				"RequiredConfidence should match expected value")
 
@@ -447,14 +435,14 @@ func TestRegressionTracker_PreAnalysis_RegressionMatching(t *testing.T) {
 			},
 			openRegressions: []*models.TestRegression{
 				{
-					ID:       1,
-					View:     "test-view",
-					Release:  sampleRelease,
-					TestID:   "foobartest1",
-					TestName: "foobar test 1",
-					Variants: []string{"foo:bar"},
-					Opened:   time.Now().UTC().Add(-5 * 24 * time.Hour),
-					Closed:   sql.NullTime{Valid: false},
+					ID:          1,
+					Release:     sampleRelease,
+					BaseRelease: baseRelease,
+					TestID:      "foobartest1",
+					TestName:    "foobar test 1",
+					Variants:    []string{"foo:bar"},
+					Opened:      time.Now().UTC().Add(-5 * 24 * time.Hour),
+					Closed:      sql.NullTime{Valid: false},
 				},
 			},
 			expectRegressionSet: true,
@@ -479,7 +467,6 @@ func TestRegressionTracker_PreAnalysis_RegressionMatching(t *testing.T) {
 			openRegressions: []*models.TestRegression{
 				{
 					ID:       1,
-					View:     "test-view",
 					Release:  sampleRelease,
 					TestID:   "foobartest1",
 					TestName: "foobar test 1",
@@ -509,7 +496,6 @@ func TestRegressionTracker_PreAnalysis_RegressionMatching(t *testing.T) {
 			openRegressions: []*models.TestRegression{
 				{
 					ID:       1,
-					View:     "test-view",
 					Release:  sampleRelease,
 					TestID:   "foobartest1",
 					TestName: "foobar test 1",
@@ -521,7 +507,7 @@ func TestRegressionTracker_PreAnalysis_RegressionMatching(t *testing.T) {
 			expectRegressionSet: false,
 		},
 		{
-			name: "view mismatch - regression should not be set",
+			name: "release mismatch - regression should not be set",
 			testKey: crtest.Identification{
 				RowIdentification: crtest.RowIdentification{
 					Component:  "foo",
@@ -539,7 +525,6 @@ func TestRegressionTracker_PreAnalysis_RegressionMatching(t *testing.T) {
 			openRegressions: []*models.TestRegression{
 				{
 					ID:       1,
-					View:     "test-view",
 					Release:  sampleRelease,
 					TestID:   "differenttest1", // Different test ID
 					TestName: "different test",
@@ -549,8 +534,7 @@ func TestRegressionTracker_PreAnalysis_RegressionMatching(t *testing.T) {
 				},
 				{
 					ID:       2,
-					View:     "different-view", // Different view
-					Release:  sampleRelease,
+					Release:  "4.17", // Different release; FindOpenRegression matches by sampleRelease
 					TestID:   "foobartest1",
 					TestName: "foobar test 1",
 					Variants: []string{"foo:bar"},
@@ -586,10 +570,9 @@ func TestRegressionTracker_PreAnalysis_RegressionMatching(t *testing.T) {
 			}
 
 			testStats := &testdetails.TestComparison{
-				ReportStatus:             crtest.SignificantRegression,
-				RequiredConfidence:       95,
-				PityAdjustment:           0,
-				MinimumFailureAdjustment: 0,
+				ReportStatus:       crtest.SignificantRegression,
+				RequiredConfidence: 95,
+				PityAdjustment:     0,
 			}
 
 			err := mw.PreAnalysis(tt.testKey, testStats)
@@ -600,15 +583,301 @@ func TestRegressionTracker_PreAnalysis_RegressionMatching(t *testing.T) {
 				assert.Equal(t, tt.expectedTestID, testStats.Regression.TestID, "Regression TestID should match")
 				// Verify adjustments are applied
 				assert.Equal(t, float64(openRegressionPityAdjustment), testStats.PityAdjustment)
-				assert.Equal(t, openRegressionMinimumFailureAdjustment, testStats.MinimumFailureAdjustment)
 				assert.Equal(t, 95-openRegressionConfidenceAdjustment, testStats.RequiredConfidence)
 			} else {
 				assert.Nil(t, testStats.Regression, "Regression should not be set")
 				// Verify no adjustments are applied
 				assert.Equal(t, float64(0), testStats.PityAdjustment)
-				assert.Equal(t, 0, testStats.MinimumFailureAdjustment)
 				assert.Equal(t, 95, testStats.RequiredConfidence)
 			}
+		})
+	}
+}
+
+func TestFindOpenRegression(t *testing.T) {
+	sampleRelease := "4.22"
+	baseRelease := "4.21"
+	testID := "test-id-1"
+	variants := map[string]string{"arch": "amd64"}
+
+	tests := []struct {
+		name            string
+		regressions     []*models.TestRegression
+		wantMatch       bool
+		wantRelease     string
+		wantBaseRelease string
+	}{
+		{
+			name: "match when sample release, testID and variants match",
+			regressions: []*models.TestRegression{
+				{
+					ID:          1,
+					Release:     sampleRelease,
+					BaseRelease: baseRelease,
+					TestID:      testID,
+					Variants:    []string{"arch:amd64"},
+				},
+			},
+			wantMatch:       true,
+			wantRelease:     sampleRelease,
+			wantBaseRelease: baseRelease,
+		},
+		{
+			name: "no match when sample release differs",
+			regressions: []*models.TestRegression{
+				{
+					ID:          1,
+					Release:     "4.20",
+					BaseRelease: "4.19",
+					TestID:      testID,
+					Variants:    []string{"arch:amd64"},
+				},
+			},
+			wantMatch: false,
+		},
+		{
+			name: "no match when testID differs",
+			regressions: []*models.TestRegression{
+				{
+					ID:          1,
+					Release:     sampleRelease,
+					BaseRelease: baseRelease,
+					TestID:      "other-test",
+					Variants:    []string{"arch:amd64"},
+				},
+			},
+			wantMatch: false,
+		},
+		{
+			name: "no match when variants differ",
+			regressions: []*models.TestRegression{
+				{
+					ID:          1,
+					Release:     sampleRelease,
+					BaseRelease: baseRelease,
+					TestID:      testID,
+					Variants:    []string{"arch:arm64"},
+				},
+			},
+			wantMatch: false,
+		},
+		{
+			name: "returns first when multiple match",
+			regressions: []*models.TestRegression{
+				{
+					ID:          2,
+					Release:     sampleRelease,
+					BaseRelease: baseRelease,
+					TestID:      testID,
+					Variants:    []string{"arch:amd64"},
+				},
+				{
+					ID:          1,
+					Release:     sampleRelease,
+					BaseRelease: baseRelease,
+					TestID:      testID,
+					Variants:    []string{"arch:amd64"},
+				},
+			},
+			wantMatch:       true,
+			wantRelease:     sampleRelease,
+			wantBaseRelease: baseRelease,
+		},
+		{
+			name: "no match when cross-compare flag differs",
+			regressions: []*models.TestRegression{
+				{
+					ID:           1,
+					Release:      sampleRelease,
+					BaseRelease:  baseRelease,
+					CrossCompare: true,
+					TestID:       testID,
+					Variants:     []string{"arch:amd64"},
+				},
+			},
+			wantMatch: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := FindOpenRegression(sampleRelease, testID, false, variants, tt.regressions)
+			if !tt.wantMatch {
+				assert.Nil(t, got, "expected no match")
+				return
+			}
+			require.NotNil(t, got, "expected a match")
+			assert.Equal(t, tt.wantRelease, got.Release)
+			assert.Equal(t, tt.wantBaseRelease, got.BaseRelease)
+			assert.Equal(t, testID, got.TestID)
+		})
+	}
+}
+
+func TestFindOpenRegression_CrossCompareIsolation(t *testing.T) {
+	sampleRelease := "5.0"
+	testID := "test-id-1"
+	variants := map[string]string{"arch": "amd64"}
+
+	// Both a standard and cross-compare regression exist for the same (release, testID, variants)
+	regressions := []*models.TestRegression{
+		{
+			ID:           1,
+			Release:      sampleRelease,
+			BaseRelease:  "4.22",
+			CrossCompare: false,
+			TestID:       testID,
+			Variants:     []string{"arch:amd64"},
+		},
+		{
+			ID:           2,
+			Release:      sampleRelease,
+			BaseRelease:  sampleRelease,
+			CrossCompare: true,
+			TestID:       testID,
+			Variants:     []string{"arch:amd64"},
+		},
+	}
+
+	t.Run("standard view selects standard regression", func(t *testing.T) {
+		got := FindOpenRegression(sampleRelease, testID, false, variants, regressions)
+		require.NotNil(t, got)
+		assert.Equal(t, uint(1), got.ID)
+		assert.False(t, got.CrossCompare)
+	})
+
+	t.Run("cross-compare view selects cross-compare regression", func(t *testing.T) {
+		got := FindOpenRegression(sampleRelease, testID, true, variants, regressions)
+		require.NotNil(t, got)
+		assert.Equal(t, uint(2), got.ID)
+		assert.True(t, got.CrossCompare)
+	})
+}
+
+// TestFindOpenRegression_SubsetMatching tests the subset variant matching behavior
+// required by TRT-2559 to support db_column_groupby modifications
+func TestFindOpenRegression_SubsetMatching(t *testing.T) {
+	sampleRelease := "4.22"
+	baseRelease := "4.21"
+	testID := "test-id-1"
+
+	tests := []struct {
+		name             string
+		inputVariants    map[string]string
+		regressionID     uint
+		regressionVars   []string
+		wantMatch        bool
+		wantRegressionID uint
+	}{
+		{
+			name: "match when input has additional variants - db_column_groupby expanded",
+			inputVariants: map[string]string{
+				"Architecture": "amd64",
+				"Platform":     "gcp",
+				"Network":      "ovn", // New variant added to db_column_groupby
+			},
+			regressionID: 1,
+			regressionVars: []string{
+				"Architecture:amd64",
+				"Platform:gcp",
+				// Regression doesn't have Network variant
+			},
+			wantMatch:        true,
+			wantRegressionID: 1,
+		},
+		{
+			name: "no match when regression has variant not in input",
+			inputVariants: map[string]string{
+				"Architecture": "amd64",
+				"Platform":     "gcp",
+				// Input doesn't have Network
+			},
+			regressionID: 2,
+			regressionVars: []string{
+				"Architecture:amd64",
+				"Platform:gcp",
+				"Network:ovn", // Regression has this but input doesn't
+			},
+			wantMatch: false,
+		},
+		{
+			name: "match when input has multiple additional variants",
+			inputVariants: map[string]string{
+				"Architecture": "amd64",
+				"Platform":     "aws",
+				"Network":      "ovn",
+				"Topology":     "ha",
+				"Upgrade":      "none",
+			},
+			regressionID: 3,
+			regressionVars: []string{
+				"Architecture:amd64",
+				"Platform:aws",
+				// Regression only has these two, input has three more
+			},
+			wantMatch:        true,
+			wantRegressionID: 3,
+		},
+		{
+			name: "no match when one regression variant value differs",
+			inputVariants: map[string]string{
+				"Architecture": "amd64",
+				"Platform":     "azure", // Different value
+				"Network":      "ovn",
+			},
+			regressionID: 4,
+			regressionVars: []string{
+				"Architecture:amd64",
+				"Platform:gcp", // Regression has gcp, input has azure
+			},
+			wantMatch: false,
+		},
+		{
+			name: "match when regression has no variants and input has many",
+			inputVariants: map[string]string{
+				"Architecture": "amd64",
+				"Platform":     "gcp",
+				"Network":      "ovn",
+			},
+			regressionID:     5,
+			regressionVars:   []string{}, // No variants in regression
+			wantMatch:        true,
+			wantRegressionID: 5,
+		},
+		{
+			name:             "match when both have no variants",
+			inputVariants:    map[string]string{},
+			regressionID:     6,
+			regressionVars:   []string{},
+			wantMatch:        true,
+			wantRegressionID: 6,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			regressions := []*models.TestRegression{
+				{
+					ID:          tt.regressionID,
+					Release:     sampleRelease,
+					BaseRelease: baseRelease,
+					TestID:      testID,
+					Variants:    tt.regressionVars,
+				},
+			}
+
+			got := FindOpenRegression(sampleRelease, testID, false, tt.inputVariants, regressions)
+
+			if !tt.wantMatch {
+				assert.Nil(t, got, "expected no match but got regression ID %v", got)
+				return
+			}
+
+			require.NotNil(t, got, "expected a match but got nil")
+			assert.Equal(t, tt.wantRegressionID, got.ID, "regression ID should match")
+			assert.Equal(t, sampleRelease, got.Release)
+			assert.Equal(t, baseRelease, got.BaseRelease)
+			assert.Equal(t, testID, got.TestID)
 		})
 	}
 }

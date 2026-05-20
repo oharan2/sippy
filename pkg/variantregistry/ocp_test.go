@@ -2,15 +2,23 @@ package variantregistry
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"testing"
 
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 
+	"github.com/openshift/sippy/pkg/apis/api"
+	"github.com/openshift/sippy/pkg/apis/api/componentreport/crview"
+	"github.com/openshift/sippy/pkg/apis/api/componentreport/reqopts"
 	v1 "github.com/openshift/sippy/pkg/apis/config/v1"
+	sippyv1 "github.com/openshift/sippy/pkg/apis/sippy/v1"
 	"github.com/openshift/sippy/pkg/flags/configflags"
+	"github.com/openshift/sippy/pkg/util/sets"
 )
 
 func TestVariantSyncer(t *testing.T) {
@@ -20,6 +28,130 @@ func TestVariantSyncer(t *testing.T) {
 		variantsFile map[string]string
 		expected     map[string]string
 	}{
+		{
+			job: "aggregated-aws-ovn-upgrade-5.1-minor-release-openshift-release-analysis-aggregator",
+			expected: map[string]string{
+				VariantRelease:          "5.1",
+				VariantReleaseMajor:     "5",
+				VariantReleaseMinor:     "1",
+				VariantFromRelease:      "5.1",
+				VariantFromReleaseMajor: "5",
+				VariantFromReleaseMinor: "1",
+				VariantArch:             "amd64",
+				VariantInstaller:        "ipi",
+				VariantPlatform:         "aws",
+				VariantProcedure:        "none",
+				VariantJobTier:          "hidden",
+				VariantNetwork:          "ovn",
+				VariantNetworkStack:     "ipv4",
+				VariantOwner:            "eng",
+				VariantSuite:            "unknown",
+				VariantTopology:         "ha",
+				VariantUpgrade:          "minor",
+				VariantAggregation:      "aggregated",
+				VariantFeatureSet:       "default",
+				VariantNetworkAccess:    VariantDefaultValue,
+				VariantScheduler:        VariantDefaultValue,
+				VariantSecurityMode:     VariantDefaultValue,
+				VariantContainerRuntime: "crun",
+				VariantCGroupMode:       "v2",
+				VariantLayeredProduct:   VariantNoValue,
+				VariantOS:               "rhcos9",
+			},
+		},
+		{
+			job: "aggregated-aws-ovn-upgrade-5.1-major-release-openshift-release-analysis-aggregator",
+			expected: map[string]string{
+				VariantRelease:          "5.1",
+				VariantReleaseMajor:     "5",
+				VariantReleaseMinor:     "1",
+				VariantFromRelease:      "5.1",
+				VariantFromReleaseMajor: "5",
+				VariantFromReleaseMinor: "1",
+				VariantArch:             "amd64",
+				VariantInstaller:        "ipi",
+				VariantPlatform:         "aws",
+				VariantProcedure:        "none",
+				VariantJobTier:          "hidden",
+				VariantNetwork:          "ovn",
+				VariantNetworkStack:     "ipv4",
+				VariantOwner:            "eng",
+				VariantSuite:            "unknown",
+				VariantTopology:         "ha",
+				VariantUpgrade:          "major",
+				VariantAggregation:      "aggregated",
+				VariantFeatureSet:       "default",
+				VariantNetworkAccess:    VariantDefaultValue,
+				VariantScheduler:        VariantDefaultValue,
+				VariantSecurityMode:     VariantDefaultValue,
+				VariantContainerRuntime: "crun",
+				VariantCGroupMode:       "v2",
+				VariantLayeredProduct:   VariantNoValue,
+				VariantOS:               "rhcos9",
+			},
+		},
+		{
+			job: "periodic-ci-openshift-release-master-ci-5.0-upgrade-from-stable-4.22-e2e-aws-upgrade",
+			expected: map[string]string{
+				VariantRelease:          "5.0",
+				VariantReleaseMajor:     "5",
+				VariantReleaseMinor:     "0",
+				VariantFromRelease:      "4.22",
+				VariantFromReleaseMajor: "4",
+				VariantFromReleaseMinor: "22",
+				VariantArch:             "amd64",
+				VariantInstaller:        "ipi",
+				VariantPlatform:         "aws",
+				VariantProcedure:        "none",
+				VariantJobTier:          "candidate",
+				VariantNetwork:          "ovn",
+				VariantNetworkStack:     "ipv4",
+				VariantOwner:            "eng",
+				VariantSuite:            "unknown",
+				VariantTopology:         "ha",
+				VariantUpgrade:          "major",
+				VariantAggregation:      VariantNoValue,
+				VariantFeatureSet:       "default",
+				VariantNetworkAccess:    VariantDefaultValue,
+				VariantScheduler:        VariantDefaultValue,
+				VariantSecurityMode:     VariantDefaultValue,
+				VariantContainerRuntime: "crun",
+				VariantCGroupMode:       "v2",
+				VariantLayeredProduct:   VariantNoValue,
+				VariantOS:               "rhcos9",
+			},
+		},
+		{
+			job: "periodic-ci-openshift-release-master-ci-5.10-upgrade-from-stable-5.9-e2e-aws-upgrade",
+			expected: map[string]string{
+				VariantRelease:          "5.10",
+				VariantReleaseMajor:     "5",
+				VariantReleaseMinor:     "10",
+				VariantFromRelease:      "5.9",
+				VariantFromReleaseMajor: "5",
+				VariantFromReleaseMinor: "9",
+				VariantArch:             "amd64",
+				VariantInstaller:        "ipi",
+				VariantPlatform:         "aws",
+				VariantProcedure:        "none",
+				VariantJobTier:          "candidate",
+				VariantNetwork:          "ovn",
+				VariantNetworkStack:     "ipv4",
+				VariantOwner:            "eng",
+				VariantSuite:            "unknown",
+				VariantTopology:         "ha",
+				VariantUpgrade:          "minor",
+				VariantAggregation:      VariantNoValue,
+				VariantFeatureSet:       "default",
+				VariantNetworkAccess:    VariantDefaultValue,
+				VariantScheduler:        VariantDefaultValue,
+				VariantSecurityMode:     VariantDefaultValue,
+				VariantContainerRuntime: "crun",
+				VariantCGroupMode:       "v2",
+				VariantLayeredProduct:   VariantNoValue,
+				VariantOS:               "rhcos9",
+			},
+		},
 		{
 			job: "periodic-ci-openshift-release-master-nightly-4.17-e2e-vsphere-ovn-multi-network-multi-a-a-techpreview",
 			variantsFile: map[string]string{
@@ -323,6 +455,68 @@ func TestVariantSyncer(t *testing.T) {
 		},
 		{
 			job: "periodic-ci-openshift-release-master-nightly-4.19-e2e-metal-ovn-two-node-fencing-upgrade",
+			expected: map[string]string{
+				VariantRelease:          "4.19",
+				VariantFromRelease:      "4.19",
+				VariantReleaseMajor:     "4",
+				VariantReleaseMinor:     "19",
+				VariantFromReleaseMajor: "4",
+				VariantFromReleaseMinor: "19",
+				VariantArch:             "amd64",
+				VariantInstaller:        "ipi",
+				VariantPlatform:         "metal",
+				VariantNetwork:          "ovn",
+				VariantNetworkStack:     "ipv4",
+				VariantOwner:            "eng",
+				VariantTopology:         "two-node-fencing",
+				VariantSuite:            "unknown",
+				VariantUpgrade:          "micro",
+				VariantAggregation:      VariantNoValue,
+				VariantProcedure:        "none",
+				VariantJobTier:          "candidate",
+				VariantFeatureSet:       VariantDefaultValue,
+				VariantNetworkAccess:    VariantDefaultValue,
+				VariantScheduler:        VariantDefaultValue,
+				VariantSecurityMode:     VariantDefaultValue,
+				VariantContainerRuntime: "crun",
+				VariantCGroupMode:       "v2",
+				VariantLayeredProduct:   VariantNoValue,
+				VariantOS:               "rhcos9",
+			},
+		},
+		{
+			job: "periodic-ci-openshift-release-master-nightly-4.19-e2e-metal-ovn-tna-upgrade",
+			expected: map[string]string{
+				VariantRelease:          "4.19",
+				VariantFromRelease:      "4.19",
+				VariantReleaseMajor:     "4",
+				VariantReleaseMinor:     "19",
+				VariantFromReleaseMajor: "4",
+				VariantFromReleaseMinor: "19",
+				VariantArch:             "amd64",
+				VariantInstaller:        "ipi",
+				VariantPlatform:         "metal",
+				VariantNetwork:          "ovn",
+				VariantNetworkStack:     "ipv4",
+				VariantOwner:            "eng",
+				VariantTopology:         "two-node-arbiter",
+				VariantSuite:            "unknown",
+				VariantUpgrade:          "micro",
+				VariantAggregation:      VariantNoValue,
+				VariantProcedure:        "none",
+				VariantJobTier:          "candidate",
+				VariantFeatureSet:       VariantDefaultValue,
+				VariantNetworkAccess:    VariantDefaultValue,
+				VariantScheduler:        VariantDefaultValue,
+				VariantSecurityMode:     VariantDefaultValue,
+				VariantContainerRuntime: "crun",
+				VariantCGroupMode:       "v2",
+				VariantLayeredProduct:   VariantNoValue,
+				VariantOS:               "rhcos9",
+			},
+		},
+		{
+			job: "periodic-ci-openshift-release-master-nightly-4.19-e2e-metal-ovn-tnf-upgrade",
 			expected: map[string]string{
 				VariantRelease:          "4.19",
 				VariantFromRelease:      "4.19",
@@ -859,6 +1053,37 @@ func TestVariantSyncer(t *testing.T) {
 			},
 		},
 		{
+			job: "release-openshift-origin-installer-e2e-aws-upgrade-4.21-to-4.22-to-5.0-ci",
+			expected: map[string]string{
+				VariantRelease:          "5.0",
+				VariantFromRelease:      "4.21",
+				VariantReleaseMajor:     "5",
+				VariantReleaseMinor:     "0",
+				VariantFromReleaseMajor: "4",
+				VariantFromReleaseMinor: "21",
+				VariantArch:             "amd64",
+				VariantInstaller:        "ipi",
+				VariantPlatform:         "aws",
+				VariantProcedure:        "none",
+				VariantJobTier:          "candidate",
+				VariantNetwork:          "ovn",
+				VariantNetworkStack:     "ipv4",
+				VariantOwner:            "eng",
+				VariantSuite:            "unknown",
+				VariantTopology:         "ha",
+				VariantUpgrade:          "multi",
+				VariantAggregation:      VariantNoValue,
+				VariantFeatureSet:       VariantDefaultValue,
+				VariantNetworkAccess:    VariantDefaultValue,
+				VariantScheduler:        VariantDefaultValue,
+				VariantSecurityMode:     VariantDefaultValue,
+				VariantContainerRuntime: "crun",
+				VariantCGroupMode:       "v2",
+				VariantLayeredProduct:   VariantNoValue,
+				VariantOS:               "rhcos9",
+			},
+		},
+		{
 			job: "periodic-ci-openshift-release-master-ci-4.15-upgrade-from-stable-4.14-from-stable-4.13-e2e-aws-sdn-upgrade",
 			expected: map[string]string{
 				VariantRelease:          "4.15",
@@ -894,6 +1119,30 @@ func TestVariantSyncer(t *testing.T) {
 			expected: map[string]string{
 				VariantArch:           "amd64",
 				VariantInstaller:      "ipi",
+				VariantNetworkStack:   "ipv4",
+				VariantOwner:          "eng",
+				VariantSuite:          "unknown",
+				VariantTopology:       "ha",
+				VariantUpgrade:        VariantNoValue,
+				VariantAggregation:    VariantNoValue,
+				VariantProcedure:      "none",
+				VariantJobTier:        "candidate",
+				VariantFeatureSet:     VariantDefaultValue,
+				VariantNetworkAccess:  VariantDefaultValue,
+				VariantScheduler:      VariantDefaultValue,
+				VariantSecurityMode:   VariantDefaultValue,
+				VariantCGroupMode:     "v2",
+				VariantLayeredProduct: VariantNoValue,
+				VariantOS:             "unknown",
+			},
+		},
+		{
+			job: "periodic-ci-openshift-master-no-release-version-e2e-aws-ovn",
+			expected: map[string]string{
+				VariantArch:           "amd64",
+				VariantInstaller:      "ipi",
+				VariantPlatform:       "aws",
+				VariantNetwork:        "ovn",
 				VariantNetworkStack:   "ipv4",
 				VariantOwner:          "eng",
 				VariantSuite:          "unknown",
@@ -1494,6 +1743,64 @@ func TestVariantSyncer(t *testing.T) {
 			},
 		},
 		{
+			job:          "periodic-ci-openshift-release-master-nightly-4.20-e2e-aws-rhcos9-10-ovn",
+			variantsFile: map[string]string{},
+			expected: map[string]string{
+				VariantRelease:          "4.20",
+				VariantReleaseMajor:     "4",
+				VariantReleaseMinor:     "20",
+				VariantArch:             "amd64",
+				VariantInstaller:        "ipi",
+				VariantPlatform:         "aws",
+				VariantProcedure:        "none",
+				VariantJobTier:          "candidate",
+				VariantNetwork:          "ovn",
+				VariantNetworkStack:     "ipv4",
+				VariantOwner:            "eng",
+				VariantSuite:            "unknown",
+				VariantTopology:         "ha",
+				VariantUpgrade:          VariantNoValue,
+				VariantAggregation:      VariantNoValue,
+				VariantFeatureSet:       VariantDefaultValue,
+				VariantNetworkAccess:    VariantDefaultValue,
+				VariantScheduler:        VariantDefaultValue,
+				VariantSecurityMode:     VariantDefaultValue,
+				VariantContainerRuntime: "crun",
+				VariantCGroupMode:       "v2",
+				VariantLayeredProduct:   VariantNoValue,
+				VariantOS:               "rhcos9-10",
+			},
+		},
+		{
+			job:          "periodic-ci-openshift-release-master-nightly-4.20-e2e-aws-rhcos9-ovn",
+			variantsFile: map[string]string{},
+			expected: map[string]string{
+				VariantRelease:          "4.20",
+				VariantReleaseMajor:     "4",
+				VariantReleaseMinor:     "20",
+				VariantArch:             "amd64",
+				VariantInstaller:        "ipi",
+				VariantPlatform:         "aws",
+				VariantProcedure:        "none",
+				VariantJobTier:          "candidate",
+				VariantNetwork:          "ovn",
+				VariantNetworkStack:     "ipv4",
+				VariantOwner:            "eng",
+				VariantSuite:            "unknown",
+				VariantTopology:         "ha",
+				VariantUpgrade:          VariantNoValue,
+				VariantAggregation:      VariantNoValue,
+				VariantFeatureSet:       VariantDefaultValue,
+				VariantNetworkAccess:    VariantDefaultValue,
+				VariantScheduler:        VariantDefaultValue,
+				VariantSecurityMode:     VariantDefaultValue,
+				VariantContainerRuntime: "crun",
+				VariantCGroupMode:       "v2",
+				VariantLayeredProduct:   VariantNoValue,
+				VariantOS:               "rhcos9",
+			},
+		},
+		{
 			job:          "periodic-ci-openshift-release-master-nightly-4.20-e2e-aws-rhcos10-ovn",
 			variantsFile: map[string]string{},
 			expected: map[string]string{
@@ -1522,6 +1829,298 @@ func TestVariantSyncer(t *testing.T) {
 				VariantOS:               "rhcos10",
 			},
 		},
+		{
+			job:          "periodic-ci-openshift-release-master-nightly-5.0-upgrade-from-nightly-4.22-major-e2e-azure",
+			variantsFile: map[string]string{},
+			expected: map[string]string{
+				VariantRelease:          "5.0",
+				VariantReleaseMajor:     "5",
+				VariantReleaseMinor:     "0",
+				VariantFromRelease:      "4.22",
+				VariantFromReleaseMajor: "4",
+				VariantFromReleaseMinor: "22",
+				VariantArch:             "amd64",
+				VariantInstaller:        "ipi",
+				VariantPlatform:         "azure",
+				VariantProcedure:        "none",
+				VariantJobTier:          "candidate",
+				VariantNetwork:          "ovn",
+				VariantNetworkStack:     "ipv4",
+				VariantOwner:            "eng",
+				VariantSuite:            "unknown",
+				VariantTopology:         "ha",
+				VariantUpgrade:          "major",
+				VariantAggregation:      VariantNoValue,
+				VariantFeatureSet:       VariantDefaultValue,
+				VariantNetworkAccess:    VariantDefaultValue,
+				VariantScheduler:        VariantDefaultValue,
+				VariantSecurityMode:     VariantDefaultValue,
+				VariantContainerRuntime: "crun",
+				VariantCGroupMode:       "v2",
+				VariantLayeredProduct:   VariantNoValue,
+				VariantOS:               "rhcos9",
+			},
+		},
+		{
+			job: "periodic-ci-openshift-release-main-nightly-4.20-e2e-metal-ipi-ovn-upgrade-runc",
+			variantsFile: map[string]string{
+				"NetworkStack": "IPv6", // cluster-data says IPv6, but release < 4.21 so job name wins
+			},
+			expected: map[string]string{
+				VariantRelease:          "4.20",
+				VariantFromRelease:      "4.20",
+				VariantReleaseMajor:     "4",
+				VariantReleaseMinor:     "20",
+				VariantFromReleaseMajor: "4",
+				VariantFromReleaseMinor: "20",
+				VariantArch:             "amd64",
+				VariantInstaller:        "ipi",
+				VariantPlatform:         "metal",
+				VariantProcedure:        "none",
+				VariantJobTier:          "candidate",
+				VariantNetwork:          "ovn",
+				VariantNetworkStack:     "ipv4", // job name wins (no -ipv6 in name = ipv4)
+				VariantOwner:            "eng",
+				VariantSuite:            "unknown",
+				VariantTopology:         "ha",
+				VariantUpgrade:          "micro",
+				VariantAggregation:      VariantNoValue,
+				VariantFeatureSet:       VariantDefaultValue,
+				VariantNetworkAccess:    VariantDefaultValue,
+				VariantScheduler:        VariantDefaultValue,
+				VariantSecurityMode:     VariantDefaultValue,
+				VariantContainerRuntime: "runc", // -runc in job name
+				VariantCGroupMode:       "v2",
+				VariantLayeredProduct:   VariantNoValue,
+				VariantOS:               "rhcos9",
+			},
+		},
+		{
+			job: "periodic-ci-openshift-release-main-nightly-4.21-e2e-metal-ipi-ovn-upgrade-runc",
+			variantsFile: map[string]string{
+				"NetworkStack": "IPv6", // cluster-data says IPv6, and release >= 4.21 so cluster-data wins
+			},
+			expected: map[string]string{
+				VariantRelease:          "4.21",
+				VariantFromRelease:      "4.21",
+				VariantReleaseMajor:     "4",
+				VariantReleaseMinor:     "21",
+				VariantFromReleaseMajor: "4",
+				VariantFromReleaseMinor: "21",
+				VariantArch:             "amd64",
+				VariantInstaller:        "ipi",
+				VariantPlatform:         "metal",
+				VariantProcedure:        "none",
+				VariantJobTier:          "candidate",
+				VariantNetwork:          "ovn",
+				VariantNetworkStack:     "ipv6", // cluster-data wins (>= 4.21)
+				VariantOwner:            "eng",
+				VariantSuite:            "unknown",
+				VariantTopology:         "ha",
+				VariantUpgrade:          "micro",
+				VariantAggregation:      VariantNoValue,
+				VariantFeatureSet:       VariantDefaultValue,
+				VariantNetworkAccess:    VariantDefaultValue,
+				VariantScheduler:        VariantDefaultValue,
+				VariantSecurityMode:     VariantDefaultValue,
+				VariantContainerRuntime: "runc", // -runc in job name
+				VariantCGroupMode:       "v2",
+				VariantLayeredProduct:   VariantNoValue,
+				VariantOS:               "rhcos9",
+			},
+		},
+		{
+			job: "periodic-ci-openshift-release-main-nightly-4.22-e2e-metal-ipi-ovn-upgrade-runc",
+			variantsFile: map[string]string{
+				"NetworkStack": "IPv6", // cluster-data says IPv6, and release >= 4.21 so cluster-data wins
+			},
+			expected: map[string]string{
+				VariantRelease:          "4.22",
+				VariantFromRelease:      "4.22",
+				VariantReleaseMajor:     "4",
+				VariantReleaseMinor:     "22",
+				VariantFromReleaseMajor: "4",
+				VariantFromReleaseMinor: "22",
+				VariantArch:             "amd64",
+				VariantInstaller:        "ipi",
+				VariantPlatform:         "metal",
+				VariantProcedure:        "none",
+				VariantJobTier:          "candidate",
+				VariantNetwork:          "ovn",
+				VariantNetworkStack:     "ipv6", // cluster-data wins (>= 4.21)
+				VariantOwner:            "eng",
+				VariantSuite:            "unknown",
+				VariantTopology:         "ha",
+				VariantUpgrade:          "micro",
+				VariantAggregation:      VariantNoValue,
+				VariantFeatureSet:       VariantDefaultValue,
+				VariantNetworkAccess:    VariantDefaultValue,
+				VariantScheduler:        VariantDefaultValue,
+				VariantSecurityMode:     VariantDefaultValue,
+				VariantContainerRuntime: "runc", // -runc in job name
+				VariantCGroupMode:       "v2",
+				VariantLayeredProduct:   VariantNoValue,
+				VariantOS:               "rhcos9",
+			},
+		},
+		{
+			job: "periodic-ci-openshift-release-main-nightly-4.20-e2e-metal-ipi-ovn-ipv6-upgrade",
+			variantsFile: map[string]string{
+				"NetworkStack": "IPv4", // cluster-data says IPv4 but job name has -ipv6, release < 4.21 so job name wins
+			},
+			expected: map[string]string{
+				VariantRelease:          "4.20",
+				VariantFromRelease:      "4.20",
+				VariantReleaseMajor:     "4",
+				VariantReleaseMinor:     "20",
+				VariantFromReleaseMajor: "4",
+				VariantFromReleaseMinor: "20",
+				VariantArch:             "amd64",
+				VariantInstaller:        "ipi",
+				VariantPlatform:         "metal",
+				VariantProcedure:        "none",
+				VariantJobTier:          "candidate",
+				VariantNetwork:          "ovn",
+				VariantNetworkStack:     "ipv6", // job name wins (< 4.21)
+				VariantOwner:            "eng",
+				VariantSuite:            "unknown",
+				VariantTopology:         "ha",
+				VariantUpgrade:          "micro",
+				VariantAggregation:      VariantNoValue,
+				VariantFeatureSet:       VariantDefaultValue,
+				VariantNetworkAccess:    "disconnected",
+				VariantScheduler:        VariantDefaultValue,
+				VariantSecurityMode:     VariantDefaultValue,
+				VariantContainerRuntime: "crun",
+				VariantCGroupMode:       "v2",
+				VariantLayeredProduct:   VariantNoValue,
+				VariantOS:               "rhcos9",
+			},
+		},
+		{
+			job: "periodic-ci-openshift-release-main-nightly-4.21-e2e-metal-ipi-ovn-ipv6-upgrade",
+			variantsFile: map[string]string{
+				"NetworkStack": "IPv4", // cluster-data says IPv4 but job name has -ipv6, release >= 4.21 so cluster-data wins
+			},
+			expected: map[string]string{
+				VariantRelease:          "4.21",
+				VariantFromRelease:      "4.21",
+				VariantReleaseMajor:     "4",
+				VariantReleaseMinor:     "21",
+				VariantFromReleaseMajor: "4",
+				VariantFromReleaseMinor: "21",
+				VariantArch:             "amd64",
+				VariantInstaller:        "ipi",
+				VariantPlatform:         "metal",
+				VariantProcedure:        "none",
+				VariantJobTier:          "candidate",
+				VariantNetwork:          "ovn",
+				VariantNetworkStack:     "ipv4", // cluster-data wins (>= 4.21)
+				VariantOwner:            "eng",
+				VariantSuite:            "unknown",
+				VariantTopology:         "ha",
+				VariantUpgrade:          "micro",
+				VariantAggregation:      VariantNoValue,
+				VariantFeatureSet:       VariantDefaultValue,
+				VariantNetworkAccess:    "disconnected",
+				VariantScheduler:        VariantDefaultValue,
+				VariantSecurityMode:     VariantDefaultValue,
+				VariantContainerRuntime: "crun",
+				VariantCGroupMode:       "v2",
+				VariantLayeredProduct:   VariantNoValue,
+				VariantOS:               "rhcos9",
+			},
+		},
+		{
+			job: "periodic-ci-openshift-release-main-nightly-4.21-e2e-aws-ovn",
+			variantsFile: map[string]string{
+				"NetworkStack": "dual", // cluster-data says dual (dualstack), release >= 4.21 so cluster-data wins
+			},
+			expected: map[string]string{
+				VariantRelease:          "4.21",
+				VariantReleaseMajor:     "4",
+				VariantReleaseMinor:     "21",
+				VariantArch:             "amd64",
+				VariantInstaller:        "ipi",
+				VariantPlatform:         "aws",
+				VariantProcedure:        "none",
+				VariantJobTier:          "candidate",
+				VariantNetwork:          "ovn",
+				VariantNetworkStack:     "dual", // cluster-data wins (>= 4.21)
+				VariantOwner:            "eng",
+				VariantSuite:            "unknown",
+				VariantTopology:         "ha",
+				VariantUpgrade:          VariantNoValue,
+				VariantAggregation:      VariantNoValue,
+				VariantFeatureSet:       VariantDefaultValue,
+				VariantNetworkAccess:    VariantDefaultValue,
+				VariantScheduler:        VariantDefaultValue,
+				VariantSecurityMode:     VariantDefaultValue,
+				VariantContainerRuntime: "crun",
+				VariantCGroupMode:       "v2",
+				VariantLayeredProduct:   VariantNoValue,
+				VariantOS:               "rhcos9",
+			},
+		},
+		{
+			job: "periodic-ci-shiftstack-ci-release-4.21-e2e-openstack-dualstack",
+			variantsFile: map[string]string{
+				"NetworkStack": "Dual", // cluster-data says "Dual" (capitalized), should be lowercased to "dual"
+				"Platform":     "openstack",
+			},
+			expected: map[string]string{
+				VariantRelease:          "4.21",
+				VariantReleaseMajor:     "4",
+				VariantReleaseMinor:     "21",
+				VariantArch:             "amd64",
+				VariantInstaller:        "ipi",
+				VariantPlatform:         "openstack",
+				VariantProcedure:        "none",
+				VariantJobTier:          "candidate",
+				VariantNetwork:          "ovn",
+				VariantNetworkStack:     "dual", // lowercased from "Dual", matches job name -dualstack
+				VariantOwner:            "eng",
+				VariantSuite:            "unknown",
+				VariantTopology:         "ha",
+				VariantUpgrade:          VariantNoValue,
+				VariantAggregation:      VariantNoValue,
+				VariantFeatureSet:       VariantDefaultValue,
+				VariantNetworkAccess:    VariantDefaultValue,
+				VariantScheduler:        VariantDefaultValue,
+				VariantSecurityMode:     VariantDefaultValue,
+				VariantContainerRuntime: "crun",
+				VariantCGroupMode:       "v2",
+				VariantLayeredProduct:   VariantNoValue,
+				VariantOS:               "rhcos9",
+			},
+		},
+		{
+			job: "periodic-ci-openshift-no-release-in-name-e2e-aws-ovn",
+			variantsFile: map[string]string{
+				"NetworkStack": "IPv6", // cluster-data says IPv6, but no release info so falls back to job name
+			},
+			expected: map[string]string{
+				VariantArch:           "amd64",
+				VariantInstaller:      "ipi",
+				VariantPlatform:       "aws",
+				VariantNetwork:        "ovn",
+				VariantNetworkStack:   "ipv4", // job name wins when release unknown
+				VariantOwner:          "eng",
+				VariantTopology:       "ha",
+				VariantSuite:          "unknown",
+				VariantUpgrade:        VariantNoValue,
+				VariantProcedure:      "none",
+				VariantJobTier:        "candidate",
+				VariantAggregation:    VariantNoValue,
+				VariantSecurityMode:   VariantDefaultValue,
+				VariantFeatureSet:     VariantDefaultValue,
+				VariantNetworkAccess:  VariantDefaultValue,
+				VariantScheduler:      VariantDefaultValue,
+				VariantCGroupMode:     "v2",
+				VariantLayeredProduct: VariantNoValue,
+				VariantOS:             "unknown",
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.job, func(t *testing.T) {
@@ -1530,6 +2129,184 @@ func TestVariantSyncer(t *testing.T) {
 					logrus.WithField("source", "TestVariantSyncer"),
 					test.job,
 					test.variantsFile))
+		})
+	}
+}
+
+func TestSyntheticReleaseVariants(t *testing.T) {
+	config := &v1.SippyConfig{
+		Releases: map[string]v1.ReleaseConfig{
+			"rosa-stage": {
+				Jobs: map[string]bool{
+					"periodic-ci-openshift-osde2e-main-nightly-4.22-osd-aws":                                         true,
+					"periodic-ci-openshift-osde2e-main-nightly-4.16-osd-aws":                                         true,
+					"periodic-ci-openshift-osde2e-main-nightly-4.22-rosa-classic-sts":                                true,
+					"periodic-ci-openshift-osde2e-main-aws-stage-informing-default":                                  true,
+					"periodic-ci-openshift-osde2e-main-osd-aws-upgrade-latest-default-y-minus-1-to-latest-default-y": true,
+					"periodic-ci-openshift-osde2e-main-osd-aws-upgrade-latest-default-y-plus-1-to-latest-y":          true,
+					"periodic-ci-openshift-osde2e-main-osd-aws-upgrade-latest-default-y-to-latest-y-plus-1":          true,
+					"periodic-ci-openshift-osde2e-main-osd-aws-upgrade-latest-default-z-minus-1-to-latest-default-z": true,
+					"periodic-ci-openshift-osde2e-main-rosa-stage-e2e-byo-vpc-proxy-install":                         true,
+					"periodic-ci-openshift-osde2e-main-rosa-stage-e2e-byo-vpc-proxy-postinstall":                     true,
+					"periodic-ci-openshift-osde2e-main-nightly-4.21-rosa-hcp":                                        true,
+					"periodic-ci-openshift-osde2e-main-nightly-4.21-osd-aws":                                         true,
+					"periodic-ci-openshift-osde2e-main-nightly-4.21-rosa-classic-sts":                                true,
+					"periodic-ci-openshift-osde2e-main-nightly-4.20-osd-aws":                                         true,
+					"periodic-ci-openshift-osde2e-main-nightly-4.20-rosa-classic-sts":                                true,
+					"periodic-ci-openshift-osde2e-main-nightly-4.19-osd-aws":                                         true,
+					"periodic-ci-openshift-osde2e-main-nightly-4.19-rosa-classic-sts":                                true,
+					"periodic-ci-openshift-osde2e-main-nightly-4.18-osd-aws":                                         true,
+					"periodic-ci-openshift-osde2e-main-nightly-4.18-rosa-classic-sts":                                true,
+					"periodic-ci-openshift-osde2e-main-nightly-4.17-osd-aws":                                         true,
+					"periodic-ci-openshift-osde2e-main-nightly-4.17-rosa-classic-sts":                                true,
+					"periodic-ci-openshift-osde2e-main-nightly-4.16-rosa-classic-sts":                                true,
+				},
+			},
+			"4.22": {
+				Jobs: map[string]bool{
+					"periodic-ci-openshift-osde2e-main-nightly-4.22-osd-aws":        true,
+					"periodic-ci-openshift-release-master-nightly-4.22-e2e-aws-ovn": true,
+				},
+			},
+		},
+	}
+
+	syntheticReleaseJobOverrides, err := BuildSyntheticReleaseJobOverrides(config.Releases, []sippyv1.Release{
+		{Release: "4.22"},
+		{Release: "rosa-stage", Synthetic: true},
+	})
+	require.NoError(t, err)
+	loader := &OCPVariantLoader{config: config, syntheticReleaseJobOverrides: syntheticReleaseJobOverrides}
+
+	tests := []struct {
+		name            string
+		job             string
+		expectedRelease string
+		expectedMajor   string
+		expectedMinor   string
+	}{
+		{
+			name:            "version in name overridden by synthetic release",
+			job:             "periodic-ci-openshift-osde2e-main-nightly-4.22-osd-aws",
+			expectedRelease: "rosa-stage",
+			expectedMajor:   "4",
+			expectedMinor:   "22",
+		},
+		{
+			name:            "older version in name overridden by synthetic release",
+			job:             "periodic-ci-openshift-osde2e-main-nightly-4.16-osd-aws",
+			expectedRelease: "rosa-stage",
+			expectedMajor:   "4",
+			expectedMinor:   "16",
+		},
+		{
+			name:            "no version in name still assigned to synthetic release",
+			job:             "periodic-ci-openshift-osde2e-main-aws-stage-informing-default",
+			expectedRelease: "rosa-stage",
+		},
+		{
+			name:            "rosa-classic-sts with version assigned to synthetic release",
+			job:             "periodic-ci-openshift-osde2e-main-nightly-4.22-rosa-classic-sts",
+			expectedRelease: "rosa-stage",
+			expectedMajor:   "4",
+			expectedMinor:   "22",
+		},
+		{
+			name:            "job not in synthetic release uses name-based extraction",
+			job:             "periodic-ci-openshift-release-master-nightly-4.22-e2e-aws-ovn",
+			expectedRelease: "4.22",
+			expectedMajor:   "4",
+			expectedMinor:   "22",
+		},
+		{
+			name:            "job in rosa-stage with rosa-stage in the name",
+			job:             "periodic-ci-openshift-osde2e-main-rosa-stage-e2e-byo-vpc-proxy-install",
+			expectedRelease: "rosa-stage",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			variants := loader.CalculateVariantsForJob(
+				logrus.WithField("source", "TestSyntheticReleaseVariants"),
+				tt.job, nil)
+			assert.Equal(t, tt.expectedRelease, variants[VariantRelease])
+			if tt.expectedMajor != "" {
+				assert.Equal(t, tt.expectedMajor, variants[VariantReleaseMajor])
+			}
+			if tt.expectedMinor != "" {
+				assert.Equal(t, tt.expectedMinor, variants[VariantReleaseMinor])
+			}
+		})
+	}
+}
+
+func TestReleaseVersionFromVariants(t *testing.T) {
+	log := logrus.WithField("test", "TestReleaseVersionFromVariants")
+
+	tests := []struct {
+		name            string
+		variants        map[string]string
+		expectedVersion string
+		expectedNil     bool
+	}{
+		{
+			name: "standard release",
+			variants: map[string]string{
+				VariantRelease: "4.22",
+			},
+			expectedVersion: "4.22",
+		},
+		{
+			name: "upgrade job uses FromRelease",
+			variants: map[string]string{
+				VariantRelease:     "4.22",
+				VariantFromRelease: "4.21",
+			},
+			expectedVersion: "4.21",
+		},
+		{
+			name: "synthetic release falls back to major/minor",
+			variants: map[string]string{
+				VariantRelease:      "rosa-stage",
+				VariantReleaseMajor: "4",
+				VariantReleaseMinor: "22",
+			},
+			expectedVersion: "4.22",
+		},
+		{
+			name: "synthetic upgrade job uses FromRelease",
+			variants: map[string]string{
+				VariantRelease:      "rosa-stage",
+				VariantFromRelease:  "4.21",
+				VariantReleaseMajor: "4",
+				VariantReleaseMinor: "22",
+			},
+			expectedVersion: "4.21",
+		},
+		{
+			name:        "no version info returns nil",
+			variants:    map[string]string{},
+			expectedNil: true,
+		},
+		{
+			name: "synthetic release with no major/minor returns nil",
+			variants: map[string]string{
+				VariantRelease: "rosa-stage",
+			},
+			expectedNil: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := releaseVersionFromVariants(log, tt.variants)
+			if tt.expectedNil {
+				assert.Nil(t, result)
+				return
+			}
+			require.NotNil(t, result)
+			assert.Equal(t, tt.expectedVersion, result.Original())
 		})
 	}
 }
@@ -1545,10 +2322,35 @@ func TestVariantsSnapshot(t *testing.T) {
 	cfg, err := cfgFlags.GetConfig()
 	assert.NoError(t, err)
 
+	viewsData, err := os.ReadFile("../../config/views.yaml")
+	assert.NoError(t, err)
+	var views api.SippyViews
+	err = yaml.Unmarshal(viewsData, &views)
+	assert.NoError(t, err)
+
+	releaseConfigs := []sippyv1.Release{
+		{Release: "4.17"},
+		{Release: "4.18"},
+		{Release: "4.19"},
+		{Release: "aro-integration", Synthetic: true},
+		{Release: "aro-production", Synthetic: true},
+		{Release: "aro-stage", Synthetic: true},
+		{Release: "automation", Synthetic: true},
+		{Release: "ocp-hypershift", Synthetic: true},
+		{Release: "rosa-integration", Synthetic: true},
+		{Release: "rosa-production", Synthetic: true},
+		{Release: "rosa-stage", Synthetic: true},
+		{Release: "rrp-integration", Synthetic: true},
+	}
+	syntheticReleaseJobOverrides, err := BuildSyntheticReleaseJobOverrides(cfg.Releases, releaseConfigs)
+	require.NoError(t, err)
+
 	log := logrus.WithField("test", "TestVariantsSnapshot")
 
-	snapshot := NewVariantSnapshot(cfg, log)
-	newVariants := snapshot.Identify()
+	snapshot := NewVariantSnapshot(cfg, views.ComponentReadiness, syntheticReleaseJobOverrides, log)
+
+	newVariants, err := snapshot.Identify()
+	assert.NoError(t, err)
 	oldVariants, err := snapshot.Load("snapshot.yaml")
 	assert.NoError(t, err)
 
@@ -1601,5 +2403,210 @@ func TestVariantsSnapshot(t *testing.T) {
 			t.Logf("%s\n   - %s", change, strings.Join(jobs, "\n   - "))
 		}
 		t.Logf("\n****** Run `make update-variants` to update the snapshot and accept these changes.")
+	}
+}
+
+func testView(name string, includeVariants map[string][]string) crview.View {
+	return crview.View{
+		Name: name,
+		VariantOptions: reqopts.Variants{
+			ColumnGroupBy:   sets.String{},
+			DBGroupBy:       sets.String{},
+			IncludeVariants: includeVariants,
+		},
+	}
+}
+
+func TestAdjustJobTierBasedOnView(t *testing.T) {
+	views := []crview.View{
+		testView("4.22-main", map[string][]string{
+			"Architecture": {"amd64", "arm64", "multi"},
+			"Platform":     {"aws", "azure", "gcp", "metal", "vsphere"},
+			"Network":      {"ovn"},
+			"JobTier":      {"blocking", "informing", "standard"},
+			"Owner":        {"eng"},
+		}),
+	}
+
+	tests := []struct {
+		name         string
+		variants     map[string]string
+		expectedTier string
+	}{
+		{
+			name: "blocking job matching all view variants stays blocking",
+			variants: map[string]string{
+				VariantRelease:  "4.22",
+				VariantJobTier:  "blocking",
+				VariantArch:     "amd64",
+				VariantPlatform: "aws",
+				VariantNetwork:  "ovn",
+				VariantOwner:    "eng",
+			},
+			expectedTier: "blocking",
+		},
+		{
+			name: "informing job with excluded platform becomes candidate",
+			variants: map[string]string{
+				VariantRelease:  "4.22",
+				VariantJobTier:  "informing",
+				VariantArch:     "amd64",
+				VariantPlatform: "rosa",
+				VariantNetwork:  "ovn",
+				VariantOwner:    "eng",
+			},
+			expectedTier: "candidate",
+		},
+		{
+			name: "standard job with excluded arch becomes candidate",
+			variants: map[string]string{
+				VariantRelease:  "4.22",
+				VariantJobTier:  "standard",
+				VariantArch:     "s390x",
+				VariantPlatform: "aws",
+				VariantNetwork:  "ovn",
+				VariantOwner:    "eng",
+			},
+			expectedTier: "candidate",
+		},
+		{
+			name: "candidate job is not adjusted even with excluded variant",
+			variants: map[string]string{
+				VariantRelease:  "4.22",
+				VariantJobTier:  "candidate",
+				VariantArch:     "s390x",
+				VariantPlatform: "rosa",
+				VariantNetwork:  "sdn",
+				VariantOwner:    "chaos",
+			},
+			expectedTier: "candidate",
+		},
+		{
+			name: "hidden job is not adjusted even with non-matching variants",
+			variants: map[string]string{
+				VariantRelease:  "4.22",
+				VariantJobTier:  "hidden",
+				VariantArch:     "s390x",
+				VariantPlatform: "rosa",
+				VariantNetwork:  "sdn",
+				VariantOwner:    "chaos",
+			},
+			expectedTier: "hidden",
+		},
+		{
+			name: "excluded job is not adjusted even with non-matching variants",
+			variants: map[string]string{
+				VariantRelease:  "4.22",
+				VariantJobTier:  "excluded",
+				VariantArch:     "s390x",
+				VariantPlatform: "rosa",
+				VariantNetwork:  "sdn",
+				VariantOwner:    "chaos",
+			},
+			expectedTier: "excluded",
+		},
+		{
+			name: "rare job is not adjusted even with non-matching variants",
+			variants: map[string]string{
+				VariantRelease:  "4.22",
+				VariantJobTier:  "rare",
+				VariantArch:     "s390x",
+				VariantPlatform: "rosa",
+				VariantNetwork:  "sdn",
+				VariantOwner:    "chaos",
+			},
+			expectedTier: "rare",
+		},
+		{
+			name: "job with no release is not adjusted",
+			variants: map[string]string{
+				VariantJobTier:  "blocking",
+				VariantArch:     "s390x",
+				VariantPlatform: "rosa",
+			},
+			expectedTier: "blocking",
+		},
+		{
+			name: "job with release that has no view is not adjusted",
+			variants: map[string]string{
+				VariantRelease:  "4.15",
+				VariantJobTier:  "blocking",
+				VariantArch:     "s390x",
+				VariantPlatform: "rosa",
+			},
+			expectedTier: "blocking",
+		},
+		{
+			// If the view requires Platform to be in [aws, azure, gcp, metal, vsphere]
+			// but the job doesn't have a Platform variant at all (e.g. couldn't be
+			// determined from the job name), we should NOT downgrade. Absence of a
+			// variant is not evidence of a mismatch — only a positive non-matching
+			// value should trigger a downgrade.
+			name: "job missing a view-filtered variant is not downgraded",
+			variants: map[string]string{
+				VariantRelease: "4.22",
+				VariantJobTier: "blocking",
+				VariantArch:    "amd64",
+				// No Platform set — view requires Platform in [aws, azure, gcp, metal, vsphere]
+				VariantNetwork: "ovn",
+				VariantOwner:   "eng",
+			},
+			expectedTier: "blocking",
+		},
+		{
+			name: "job with variant not specified in view is not filtered",
+			variants: map[string]string{
+				VariantRelease:  "4.22",
+				VariantJobTier:  "blocking",
+				VariantArch:     "amd64",
+				VariantPlatform: "aws",
+				VariantNetwork:  "ovn",
+				VariantOwner:    "eng",
+				VariantSuite:    "serial", // Suite not in view's include_variants
+			},
+			expectedTier: "blocking",
+		},
+		{
+			name: "standard job with excluded network becomes candidate",
+			variants: map[string]string{
+				VariantRelease:  "4.22",
+				VariantJobTier:  "standard",
+				VariantArch:     "amd64",
+				VariantPlatform: "aws",
+				VariantNetwork:  "sdn",
+				VariantOwner:    "eng",
+			},
+			expectedTier: "candidate",
+		},
+		{
+			name: "standard job with excluded owner becomes candidate",
+			variants: map[string]string{
+				VariantRelease:  "4.22",
+				VariantJobTier:  "standard",
+				VariantArch:     "amd64",
+				VariantPlatform: "aws",
+				VariantNetwork:  "ovn",
+				VariantOwner:    "qe",
+			},
+			expectedTier: "candidate",
+		},
+	}
+
+	loader := &OCPVariantLoader{
+		config: &v1.SippyConfig{},
+		views:  views,
+	}
+	jLog := logrus.WithField("test", "TestAdjustJobTierBasedOnView")
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Copy variants to avoid mutation across tests
+			variants := make(map[string]string)
+			for k, v := range tt.variants {
+				variants[k] = v
+			}
+			loader.adjustJobTierBasedOnView(jLog, "test-job", variants)
+			assert.Equal(t, tt.expectedTier, variants[VariantJobTier])
+		})
 	}
 }

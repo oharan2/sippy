@@ -7,38 +7,46 @@ import (
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 
+	"github.com/openshift/sippy/pkg/apis/api/componentreport/crview"
 	v1 "github.com/openshift/sippy/pkg/apis/config/v1"
+	"github.com/openshift/sippy/pkg/releaseoverride"
 )
 
 // JobVariants is a map of jobs to variant key/value pairs
 type JobVariants map[string]map[string]string
 
 type VariantSnapshot struct {
-	config *v1.SippyConfig
-	log    logrus.FieldLogger
+	config                       *v1.SippyConfig
+	views                        []crview.View
+	syntheticReleaseJobOverrides *releaseoverride.SyntheticReleaseOverrides
+	log                          logrus.FieldLogger
 }
 
-func NewVariantSnapshot(config *v1.SippyConfig, log logrus.FieldLogger) *VariantSnapshot {
+func NewVariantSnapshot(config *v1.SippyConfig, views []crview.View, syntheticReleaseJobOverrides *releaseoverride.SyntheticReleaseOverrides, log logrus.FieldLogger) *VariantSnapshot {
 	return &VariantSnapshot{
-		config: config,
-		log:    log,
+		config:                       config,
+		views:                        views,
+		syntheticReleaseJobOverrides: syntheticReleaseJobOverrides,
+		log:                          log,
 	}
 }
 
-func (s *VariantSnapshot) Identify() JobVariants {
+func (s *VariantSnapshot) Identify() (JobVariants, error) {
 	newVariants := map[string]map[string]string{}
-	variantSyncer := OCPVariantLoader{config: s.config}
+	variantSyncer := OCPVariantLoader{config: s.config, views: s.views, syntheticReleaseJobOverrides: s.syntheticReleaseJobOverrides}
 	for _, releaseCfg := range s.config.Releases {
 		for job := range releaseCfg.Jobs {
 			if isIgnoredJob(job) {
 				continue
 			}
-
-			newVariants[job] = variantSyncer.IdentifyVariants(s.log, job)
+			if _, done := newVariants[job]; done {
+				continue
+			}
+			newVariants[job] = variantSyncer.CalculateVariantsForJob(s.log, job, nil)
 		}
 	}
 
-	return newVariants
+	return newVariants, nil
 }
 
 func (s *VariantSnapshot) Load(path string) (JobVariants, error) {
@@ -55,7 +63,10 @@ func (s *VariantSnapshot) Load(path string) (JobVariants, error) {
 }
 
 func (s *VariantSnapshot) Save(path string) error {
-	newVariants := s.Identify()
+	newVariants, err := s.Identify()
+	if err != nil {
+		return err
+	}
 	y, err := yaml.Marshal(newVariants)
 	if err != nil {
 		return err

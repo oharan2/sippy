@@ -47,29 +47,30 @@ func TestFunctional_FilterFiles(t *testing.T) {
 
 func TestFunctional_FilterContent(t *testing.T) {
 	const filePath = "logs/periodic-ci-openshift-release-master-ci-4.19-e2e-azure-ovn/1898704060324777984/artifacts/e2e-azure-ovn/gather-extra/build-log.txt"
+	ctx := context.Background()
 
 	query := baseTestingJAQ(t, "", NewStringMatcher("ClusterVersion:", 0, 0, maxFileMatches))
-	artifact := query.getFileContentMatches(1898704060324777984, &storage.ObjectAttrs{Name: filePath})
+	artifact := query.getFileContentMatches(ctx, 1898704060324777984, &storage.ObjectAttrs{Name: filePath})
 	assert.Empty(t, artifact.Error)
-	assert.False(t, artifact.MatchedContent.ContentLineMatches.Truncated, "expected no need for truncating the content matches")
-	assert.Equal(t, 2, len(artifact.MatchedContent.ContentLineMatches.Matches), "expected content to match with two lines")
+	assert.False(t, artifact.Truncated, "expected no need for truncating the content matches")
+	assert.Equal(t, 2, len(artifact.Matches), "expected content to match with two lines")
 
 	query.ContentMatcher = NewStringMatcher("error:", 0, 0, maxFileMatches)
-	artifact = query.getFileContentMatches(1898704060324777984, &storage.ObjectAttrs{Name: filePath})
+	artifact = query.getFileContentMatches(ctx, 1898704060324777984, &storage.ObjectAttrs{Name: filePath})
 	assert.Empty(t, artifact.Error)
-	assert.True(t, artifact.MatchedContent.ContentLineMatches.Truncated, "expected to truncate content matches")
-	assert.Equal(t, maxFileMatches, len(artifact.MatchedContent.ContentLineMatches.Matches), "expected content to match with many lines")
+	assert.True(t, artifact.Truncated, "expected to truncate content matches")
+	assert.Equal(t, maxFileMatches, len(artifact.Matches), "expected content to match with many lines")
 }
 
 func TestFunctional_GzipContent(t *testing.T) {
 	const filePath = "logs/periodic-ci-openshift-release-master-ci-4.19-e2e-aws-ovn-techpreview/1909930323508989952/artifacts/e2e-aws-ovn-techpreview/gather-extra/artifacts/nodes/ip-10-0-59-177.us-east-2.compute.internal/journal"
 
 	query := baseTestingJAQ(t, "", NewStringMatcher("error", 0, 0, maxFileMatches))
-	artifact := query.getFileContentMatches(1909930323508989952, &storage.ObjectAttrs{Name: filePath, ContentType: "application/gzip"})
+	artifact := query.getFileContentMatches(context.Background(), 1909930323508989952, &storage.ObjectAttrs{Name: filePath, ContentType: "application/gzip"})
 	assert.Empty(t, artifact.Error)
-	assert.True(t, artifact.MatchedContent.ContentLineMatches.Truncated, "expected a lot of matches")
+	assert.True(t, artifact.Truncated, "expected a lot of matches")
 	assert.Contains(t,
-		artifact.MatchedContent.ContentLineMatches.Matches[0].Match,
+		artifact.Matches[0].Match,
 		"localhost kernel: GPT: Use GNU Parted to correct GPT errors.",
 		"expected to scan uncompressed text")
 }

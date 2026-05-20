@@ -1,13 +1,23 @@
 import {
   Backdrop,
+  Box,
   Button,
   CircularProgress,
   Container,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
+  Grid,
+  IconButton,
+  List,
+  ListItem,
+  ListItemText,
   Tooltip,
   Typography,
 } from '@mui/material'
 import { DataGrid } from '@mui/x-data-grid'
-import { DirectionsBoat, GitHub } from '@mui/icons-material'
+import { DirectionsBoat, GitHub, Search } from '@mui/icons-material'
 import {
   getReportStartDate,
   pathForExactJob,
@@ -20,8 +30,10 @@ import { NumberParam, StringParam, useQueryParam } from 'use-query-params'
 import { ReportEndContext } from '../App'
 import Alert from '@mui/material/Alert'
 import GridToolbar from '../datagrid/GridToolbar'
+import JobArtifactQuery from '../component_readiness/JobArtifactQuery'
 import PropTypes from 'prop-types'
 import React, { Fragment, useEffect } from 'react'
+import ReactMarkdown from 'react-markdown'
 
 /**
  * JobRunsTable shows the list of all job runs matching any selected filters.
@@ -30,6 +42,13 @@ export default function JobRunsTable(props) {
   const [fetchError, setFetchError] = React.useState('')
   const [isLoaded, setLoaded] = React.useState(false)
   const [apiResult, setApiResult] = React.useState([])
+  const [labelsDialogOpen, setLabelsDialogOpen] = React.useState(false)
+  const [selectedLabels, setSelectedLabels] = React.useState([])
+  const [selectedJobRun, setSelectedJobRun] = React.useState(null)
+  const [allLabels, setAllLabels] = React.useState({})
+  const [selectionModel, setSelectionModel] = React.useState([])
+  const [jaqOpen, setJaqOpen] = React.useState(false)
+  const [jaqJobRunIds, setJaqJobRunIds] = React.useState(null)
 
   const [filterModel = props.filterModel, setFilterModel] = useQueryParam(
     'filters',
@@ -55,13 +74,80 @@ export default function JobRunsTable(props) {
     f: 'failure (other tests)',
     A: 'Aborted',
     U: 'upgrade failure',
-    I: 'setup failure (installer)',
-    N: 'setup failure (infrastructure)',
-    n: 'failure before setup (infra)',
+    I: 'install failure',
+    N: 'external infrastructure failure',
+    n: 'internal infrastructure failure',
     R: 'running',
   }
 
   const startDate = getReportStartDate(React.useContext(ReportEndContext))
+
+  function extractProwRunId(url) {
+    if (!url) return null
+    const parts = url.replace(/\/+$/, '').split('/')
+    return parts[parts.length - 1]
+  }
+
+  function buildJaqProps(rows) {
+    const jobRunIds = new Set()
+    const lookup = new Map()
+    for (const row of rows) {
+      // Extract the run ID from the prow URL to avoid JS number precision loss
+      const runId = extractProwRunId(row.url)
+      if (!runId) continue
+      jobRunIds.add(runId)
+      lookup.set(runId, {
+        job_run_id: runId,
+        job_name: row.job,
+        start_time: row.timestamp,
+        test_status: row.overall_result,
+        url: row.url,
+      })
+    }
+    return { jobRunIds, lookup }
+  }
+
+  function openJaqForRows(rows) {
+    const { jobRunIds, lookup } = buildJaqProps(rows)
+    setJaqJobRunIds({ ids: jobRunIds, lookup })
+    setJaqOpen(true)
+  }
+
+  function handleToggleJAQOpen() {
+    setJaqOpen(!jaqOpen)
+  }
+
+  // Extract test names from filters to show a "Test result" column
+  const testFilterFields = [
+    'ran_test_names',
+    'failed_test_names',
+    'flaked_test_names',
+  ]
+  const filteredTestNames = (filterModel?.items || [])
+    .filter(
+      (f) =>
+        testFilterFields.includes(f.columnField) &&
+        f.value &&
+        !(f.not && f.columnField === 'ran_test_names')
+    )
+    .map((f) => f.value)
+  const uniqueFilteredTestNames = [...new Set(filteredTestNames)]
+
+  function getTestResult(row, testName) {
+    if (row.failed_test_names && row.failed_test_names.includes(testName)) {
+      return 'Fail'
+    }
+    if (row.flaked_test_names && row.flaked_test_names.includes(testName)) {
+      return 'Flake'
+    }
+    return 'Pass'
+  }
+
+  const testResultLabels = {
+    Pass: { className: 'result-S' },
+    Fail: { className: 'result-F' },
+    Flake: { className: 'result-U' },
+  }
 
   const columns = [
     {
@@ -126,7 +212,7 @@ export default function JobRunsTable(props) {
     },
     {
       field: 'overall_result',
-      headerName: 'Result',
+      headerName: 'Job result',
       flex: 0.5,
       renderCell: (params) => {
         return (
@@ -137,6 +223,75 @@ export default function JobRunsTable(props) {
             >
               {params.value}
             </div>
+          </Tooltip>
+        )
+      },
+    },
+    ...uniqueFilteredTestNames.map((testName, idx) => ({
+      field: `test_result_${idx}`,
+      headerName: testName,
+      flex: 0.75,
+      minWidth: 110,
+      sortable: false,
+      filterable: false,
+      renderHeader: () => {
+        const label =
+          testName.length > 30 ? testName.substring(0, 27) + '...' : testName
+        return (
+          <Tooltip title={testName}>
+            <span>{label}</span>
+          </Tooltip>
+        )
+      },
+      renderCell: (params) => {
+        const result = getTestResult(params.row, testName)
+        const { className } = testResultLabels[result]
+        return (
+          <div
+            className={'result ' + className}
+            style={{ width: '100%', textAlign: 'center' }}
+          >
+            {result}
+          </div>
+        )
+      },
+    })),
+    {
+      field: 'labels',
+      autocomplete: 'labels',
+      headerName: 'Labels',
+      type: 'array',
+      flex: 0.5,
+      sortable: false,
+      renderCell: (params) => {
+        if (!params.value || params.value.length === 0) {
+          return ''
+        }
+        const labelTitles = params.value.map((labelId) => {
+          const label = allLabels[labelId]
+          return label ? label.label_title : labelId
+        })
+        return (
+          <Tooltip
+            title={
+              <div>
+                {labelTitles.map((title, idx) => (
+                  <div key={idx}>{title}</div>
+                ))}
+              </div>
+            }
+          >
+            <Button
+              color="primary"
+              variant="text"
+              onClick={() => {
+                setSelectedLabels(params.value)
+                setSelectedJobRun(params.row)
+                setLabelsDialogOpen(true)
+              }}
+            >
+              {params.value.length}
+            </Button>
           </Tooltip>
         )
       },
@@ -183,21 +338,50 @@ export default function JobRunsTable(props) {
       },
     },
     {
+      field: 'artifact_search',
+      headerName: ' ',
+      flex: 0.4,
+      sortable: false,
+      filterable: false,
+      renderCell: (params) => {
+        return (
+          <Tooltip title="Search job artifacts">
+            <IconButton
+              size="small"
+              onClick={() => openJaqForRows([params.row])}
+            >
+              <Search />
+            </IconButton>
+          </Tooltip>
+        )
+      },
+    },
+    {
       field: 'variants',
+      type: 'array',
       autocomplete: 'variants',
       headerName: 'Variants',
       hide: true,
     },
     {
       field: 'failed_test_names',
+      type: 'array',
       autocomplete: 'tests',
       headerName: 'Failed tests',
       hide: true,
     },
     {
       field: 'flaked_test_names',
+      type: 'array',
       autocomplete: 'tests',
       headerName: 'Flaked tests',
+      hide: true,
+    },
+    {
+      field: 'ran_test_names',
+      type: 'array',
+      autocomplete: 'tests',
+      headerName: 'Tests ran',
       hide: true,
     },
     {
@@ -239,42 +423,6 @@ export default function JobRunsTable(props) {
       headerName: 'Build cluster',
       type: 'string',
       hide: 'true',
-    },
-    {
-      field: 'current_pass_percentage',
-      headerName: 'Current pass percentage',
-      type: 'number',
-      hide: true,
-    },
-    {
-      field: 'current_runs',
-      headerName: 'Current runs',
-      type: 'number',
-      hide: true,
-    },
-    {
-      field: 'previous_runs',
-      headerName: 'Previous runs',
-      type: 'number',
-      hide: true,
-    },
-    {
-      field: 'net_improvement',
-      headerName: 'Net improvement',
-      type: 'number',
-      hide: true,
-    },
-    {
-      field: 'bugs',
-      headerName: 'Bug count',
-      type: 'number',
-      hide: true,
-    },
-    {
-      field: 'associated_bugs',
-      headerName: 'Associated bug count',
-      type: 'number',
-      hide: true,
     },
   ]
 
@@ -336,6 +484,32 @@ export default function JobRunsTable(props) {
   useEffect(() => {
     fetchData()
   }, [filterModel, sort, sortField, page, pageSize])
+
+  // Fetch label definitions
+  useEffect(() => {
+    fetch(process.env.REACT_APP_API_URL + '/api/jobs/labels')
+      .then((response) => {
+        if (response.status !== 200) {
+          console.warn(
+            'Labels API returned unsuccessful status: ' + response.statusText
+          )
+          return {}
+        }
+        return response.json()
+      })
+      .then((labels) => {
+        const labelMap = {}
+        if (labels && Array.isArray(labels)) {
+          labels.forEach((label) => {
+            labelMap[label.id] = label
+          })
+        }
+        setAllLabels(labelMap)
+      })
+      .catch((error) => {
+        console.error('Could not fetch labels:', error)
+      })
+  }, [])
 
   const pageTitle = () => {
     if (props.title) {
@@ -406,7 +580,7 @@ export default function JobRunsTable(props) {
         <span className="results results-demo">
           <span className="result result-f">f</span>
         </span>{' '}
-        failure (other tests)
+        unknown failure (legacy)
       </span>
       <span className="legend-item">
         <span className="results results-demo">
@@ -418,19 +592,19 @@ export default function JobRunsTable(props) {
         <span className="results results-demo">
           <span className="result result-I">I</span>
         </span>{' '}
-        setup failure (installer)
+        install failure
       </span>
       <span className="legend-item">
         <span className="results results-demo">
           <span className="result result-N">N</span>
         </span>{' '}
-        setup failure (infra)
+        external infrastructure failure
       </span>
       <span className="legend-item">
         <span className="results results-demo">
           <span className="result result-n">n</span>
         </span>{' '}
-        failure before setup (infra)
+        internal infrastructure failure
       </span>
       <span className="legend-item">
         <span className="results results-demo">
@@ -457,6 +631,9 @@ export default function JobRunsTable(props) {
       onPageChange={(newPage) => changePage(newPage)}
       columns={columns}
       autoHeight={true}
+      checkboxSelection
+      onSelectionModelChange={(newSelection) => setSelectionModel(newSelection)}
+      selectionModel={selectionModel}
       // Filtering:
       filterMode="server"
       sortingOrder={['desc', 'asc']}
@@ -490,6 +667,89 @@ export default function JobRunsTable(props) {
     return table
   }
 
+  const labelsDialog = (
+    <Dialog
+      open={labelsDialogOpen}
+      onClose={() => setLabelsDialogOpen(false)}
+      maxWidth="sm"
+      fullWidth
+    >
+      <DialogTitle>
+        {selectedJobRun
+          ? `Labels for ${selectedJobRun.job} - ${new Date(
+              selectedJobRun.timestamp
+            ).toLocaleString()}`
+          : 'Job Run Labels'}
+      </DialogTitle>
+      <DialogContent>
+        <List>
+          {selectedLabels.map((labelId) => {
+            const label = allLabels[labelId]
+            return (
+              <ListItem key={labelId}>
+                <ListItemText
+                  primary={label ? label.label_title : labelId}
+                  secondary={
+                    label ? (
+                      <ReactMarkdown>{label.explanation}</ReactMarkdown>
+                    ) : (
+                      'Label not found'
+                    )
+                  }
+                />
+              </ListItem>
+            )
+          })}
+        </List>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={() => setLabelsDialogOpen(false)} color="primary">
+          Close
+        </Button>
+      </DialogActions>
+    </Dialog>
+  )
+
+  const jaqDialog = (
+    <Dialog
+      fullWidth={true}
+      maxWidth={false}
+      open={jaqOpen}
+      onClose={handleToggleJAQOpen}
+    >
+      <Grid className="jaq-dialog" tabIndex="0">
+        <Box
+          sx={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            mb: 2,
+          }}
+        >
+          <Typography variant="h4" component="h1">
+            Job Artifact Search
+          </Typography>
+          <Button
+            size="large"
+            variant="contained"
+            onClick={handleToggleJAQOpen}
+          >
+            Close
+          </Button>
+        </Box>
+        <Box sx={{ flex: 1 }}>
+          {jaqOpen && jaqJobRunIds && (
+            <JobArtifactQuery
+              searchJobRunIds={jaqJobRunIds.ids}
+              jobRunsLookup={jaqJobRunIds.lookup}
+              handleToggleJAQOpen={handleToggleJAQOpen}
+            />
+          )}
+        </Box>
+      </Grid>
+    </Dialog>
+  )
+
   /* eslint-disable react/prop-types */
   return (
     <Fragment>
@@ -499,7 +759,26 @@ export default function JobRunsTable(props) {
       {legend}
       <Container size="xl" style={{ marginTop: 20 }}>
         {table}
+        {selectionModel.length > 0 && (
+          <Box sx={{ mt: 2 }}>
+            <Button
+              variant="contained"
+              color="primary"
+              startIcon={<Search />}
+              onClick={() => {
+                const selectedRows = apiResult.rows.filter((row) =>
+                  selectionModel.includes(row.id)
+                )
+                openJaqForRows(selectedRows)
+              }}
+            >
+              Search Artifacts
+            </Button>
+          </Box>
+        )}
       </Container>
+      {labelsDialog}
+      {jaqDialog}
     </Fragment>
   )
 }

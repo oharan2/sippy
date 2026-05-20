@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/openshift/sippy/pkg/bigquery/bqlabel"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
@@ -16,6 +17,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	resources "github.com/openshift/sippy"
+	bqprovider "github.com/openshift/sippy/pkg/api/componentreadiness/dataprovider/bigquery"
 	"github.com/openshift/sippy/pkg/apis/cache"
 	v1 "github.com/openshift/sippy/pkg/apis/config/v1"
 	"github.com/openshift/sippy/pkg/bigquery"
@@ -138,8 +140,15 @@ func (f *ComponentReadinessFlags) runServerMode() error {
 	var bigQueryClient *bigquery.Client
 	var gcsClient *storage.Client
 	if f.GoogleCloudFlags.ServiceAccountCredentialFile != "" {
-		bigQueryClient, err = f.BigQueryFlags.GetBigQueryClient(context.Background(),
-			cacheClient, f.GoogleCloudFlags.ServiceAccountCredentialFile)
+		opCtx := bqlabel.OperationalContext{
+			App:         bqlabel.AppSippy,
+			Command:     "component-readiness",
+			Environment: bqlabel.EnvCli,
+		}
+		if os.Getenv("SIPPY_WEB_ENV") == string(bqlabel.EnvWebQE) {
+			opCtx.Environment = bqlabel.EnvWebQE
+		}
+		bigQueryClient, err = f.BigQueryFlags.GetBigQueryClient(context.Background(), opCtx, cacheClient, f.GoogleCloudFlags.ServiceAccountCredentialFile)
 		if err != nil {
 			return errors.WithMessage(err, "couldn't get bigquery client")
 		}
@@ -178,6 +187,8 @@ func (f *ComponentReadinessFlags) runServerMode() error {
 		log.WithError(err).Warn("unable to initialize Jira client, bug filing will be disabled")
 	}
 
+	crDataProvider := bqprovider.NewBigQueryProvider(bigQueryClient, config.ComponentReadinessConfig.VariantJunitTableOverrides)
+
 	server := sippyserver.NewServer(
 		sippyserver.ModeOpenShift,
 		f.APIFlags.ListenAddr,
@@ -190,6 +201,7 @@ func (f *ComponentReadinessFlags) runServerMode() error {
 		gcsClient,
 		f.GoogleCloudFlags.StorageBucket,
 		bigQueryClient,
+		crDataProvider,
 		nil,
 		cacheClient,
 		f.ComponentReadinessFlags.CRTimeRoundingFactor,
@@ -206,10 +218,10 @@ func (f *ComponentReadinessFlags) runServerMode() error {
 			context.Background(),
 			dbc,
 			bigQueryClient,
+			crDataProvider,
 			time.Time{},
-			cache.RequestOptions{CRTimeRoundingFactor: f.ComponentReadinessFlags.CRTimeRoundingFactor},
-			views.ComponentReadiness,
-			config.ComponentReadinessConfig.VariantJunitTableOverrides)
+			cache.NewStandardCROptions(f.ComponentReadinessFlags.CRTimeRoundingFactor),
+			views.ComponentReadiness)
 		if err != nil {
 			log.WithError(err).Error("error refreshing metrics")
 		}
@@ -226,10 +238,10 @@ func (f *ComponentReadinessFlags) runServerMode() error {
 						context.Background(),
 						dbc,
 						bigQueryClient,
+						crDataProvider,
 						time.Time{},
-						cache.RequestOptions{CRTimeRoundingFactor: f.ComponentReadinessFlags.CRTimeRoundingFactor},
-						views.ComponentReadiness,
-						config.ComponentReadinessConfig.VariantJunitTableOverrides)
+						cache.NewStandardCROptions(f.ComponentReadinessFlags.CRTimeRoundingFactor),
+						views.ComponentReadiness)
 					if err != nil {
 						log.WithError(err).Error("error refreshing metrics")
 					}

@@ -33,7 +33,7 @@ echo "The kubectl command is: ${KUBECTL_CMD}"
 #
 ${KUBECTL_CMD} create secret generic gcs-cred --from-file gcs-cred=$GCS_CRED -n sippy-e2e
 
-# Launch the sippy api server pod.
+# Launch the sippy api server pod with coverage instrumentation.
 cat << END | ${KUBECTL_CMD} apply -f -
 apiVersion: v1
 kind: Pod
@@ -61,11 +61,11 @@ spec:
         - "Wait for a short time"
     resources:
       limits:
-        memory: 5Gi
+        memory: 8Gi
     terminationMessagePath: /dev/termination-log
     terminationMessagePolicy: File
     command:
-    - /bin/sippy
+    - /bin/sippy-cover
     args:
     - serve
     - --listen
@@ -82,20 +82,29 @@ spec:
     - --mode
     - ocp
     - --views
-    - ./config/e2e-views.yaml
+    - ./config/seed-views.yaml
+    - --data-provider
+    - postgres
     env:
     - name: GCS_SA_JSON_PATH
       value: /tmp/secrets/gcs-cred
+    - name: GOCOVERDIR
+      value: /tmp/coverage
     volumeMounts:
     - mountPath: /tmp/secrets
       name: gcs-cred
       readOnly: true
+    - mountPath: /tmp/coverage
+      name: coverage
   imagePullSecrets:
   - name: regcred
   volumes:
     - name: gcs-cred
       secret:
         secretName: gcs-cred
+    - name: coverage
+      persistentVolumeClaim:
+        claimName: sippy-coverage
   dnsPolicy: ClusterFirst
   restartPolicy: Always
   schedulerName: default-scheduler
@@ -105,10 +114,25 @@ END
 
 # The basic readiness probe will give us at least 10 seconds before declaring the pod as ready.
 echo "Waiting for sippy api server pod to be Ready ..."
+set +e
 ${KUBECTL_CMD} -n sippy-e2e wait --for=condition=Ready pod/sippy-server --timeout=600s
+server_retVal=$?
+set -e
 
 ${KUBECTL_CMD} -n sippy-e2e get pod -o wide
-${KUBECTL_CMD} -n sippy-e2e logs sippy-server > ${ARTIFACT_DIR}/sippy-server.log
+${KUBECTL_CMD} -n sippy-e2e logs sippy-server > ${ARTIFACT_DIR}/sippy-server.log 2>&1
+
+if [ ${server_retVal} -ne 0 ]; then
+  echo
+  echo "=== SIPPY SERVER FAILURE DIAGNOSTICS ==="
+  ${KUBECTL_CMD} -n sippy-e2e describe pod/sippy-server
+  echo "=== Namespace events ==="
+  ${KUBECTL_CMD} -n sippy-e2e get events --sort-by='.lastTimestamp'
+  echo "=== END SIPPY SERVER FAILURE DIAGNOSTICS ==="
+  echo
+  echo "ERROR: sippy-server pod never became Ready (timed out after 600s)"
+  exit 1
+fi
 
 echo "Setup services and port forwarding for the sippy api server ..."
 
@@ -144,7 +168,89 @@ ${KUBECTL_CMD} -n sippy-e2e port-forward pod/redis1 ${SIPPY_REDIS_PORT}:6379 &
 
 ${KUBECTL_CMD} -n sippy-e2e get svc,ep
 
-${KUBECTL_CMD} -n sippy-e2e delete secret regcred
+# Wait for the sippy API to be reachable through the port-forward
+echo "Waiting for sippy API to be reachable on port ${SIPPY_API_PORT}..."
+TIMEOUT=120
+ELAPSED=0
+while [ $ELAPSED -lt $TIMEOUT ]; do
+    if curl -s "http://localhost:${SIPPY_API_PORT}/api/health" > /dev/null 2>&1; then
+        echo "Sippy API is ready after ${ELAPSED}s"
+        break
+    fi
+    sleep 2
+    ELAPSED=$((ELAPSED + 2))
+done
+if [ $ELAPSED -ge $TIMEOUT ]; then
+    echo "ERROR: Timed out waiting for sippy API after ${TIMEOUT}s"
+    exit 1
+fi
+
+# Prime the component readiness cache so triage tests can find cached reports
+echo "Priming component readiness cache..."
+VIEWS=$(curl -sf "http://localhost:${SIPPY_API_PORT}/api/component_readiness/views") || { echo "Failed to fetch views"; exit 1; }
+for VIEW in $(echo "$VIEWS" | grep -o '"name":"[^"]*"' | cut -d'"' -f4); do
+    echo "  Priming cache for view: $VIEW"
+    curl -sf "http://localhost:${SIPPY_API_PORT}/api/component_readiness?view=$VIEW" > /dev/null || { echo "Failed to prime cache for view: $VIEW"; exit 1; }
+done
+echo "Cache priming complete"
 
 # only 1 in parallel, some tests will clash if run at the same time
-go test ./test/e2e/... -v -p 1
+gotestsum --junitfile ${ARTIFACT_DIR}/junit_e2e.xml -- ./test/e2e/... -v -p 1 -coverprofile=${ARTIFACT_DIR}/e2e-test-coverage.out -coverpkg=./pkg/...,./cmd/...
+TEST_EXIT=$?
+
+# Collect coverage data. Coverage counters are flushed when the server exits.
+# Pod deletion sends SIGTERM during graceful termination (terminationGracePeriodSeconds: 30),
+# so we just delete the pod directly — no need for a separate exec kill.
+echo "Stopping sippy-server to flush coverage data..."
+${KUBECTL_CMD} -n sippy-e2e delete pod sippy-server --wait=true --timeout=60s || true
+
+# Launch a minimal helper pod to access the coverage PVC.
+cat << END | ${KUBECTL_CMD} apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: coverage-helper
+  namespace: sippy-e2e
+spec:
+  containers:
+  - name: helper
+    image: ${SIPPY_IMAGE}
+    command: ["sleep", "300"]
+    volumeMounts:
+    - mountPath: /tmp/coverage
+      name: coverage
+      readOnly: true
+  imagePullSecrets:
+  - name: regcred
+  volumes:
+  - name: coverage
+    persistentVolumeClaim:
+      claimName: sippy-coverage
+  restartPolicy: Never
+END
+
+${KUBECTL_CMD} -n sippy-e2e wait --for=condition=Ready pod/coverage-helper --timeout=60s
+
+COVDIR=$(mktemp -d)
+${KUBECTL_CMD} -n sippy-e2e cp coverage-helper:/tmp/coverage "${COVDIR}" -c helper || true
+
+if find "${COVDIR}" -name 'covcounters.*' -print -quit 2>/dev/null | grep -q .; then
+    echo "Generating coverage report..."
+    go tool covdata percent -i="${COVDIR}"
+    go tool covdata textfmt -i="${COVDIR}" -o="${ARTIFACT_DIR}/e2e-coverage.out"
+    # Merge test binary coverage (from -coverprofile) into server binary coverage
+    if [ -f "${ARTIFACT_DIR}/e2e-test-coverage.out" ]; then
+        echo "Merging test binary coverage into server coverage..."
+        tail -n +2 "${ARTIFACT_DIR}/e2e-test-coverage.out" >> "${ARTIFACT_DIR}/e2e-coverage.out"
+        rm -f "${ARTIFACT_DIR}/e2e-test-coverage.out"
+    fi
+    go tool cover -html="${ARTIFACT_DIR}/e2e-coverage.out" -o="${ARTIFACT_DIR}/e2e-coverage.html"
+    echo "Coverage report written to ${ARTIFACT_DIR}/e2e-coverage.html"
+else
+    echo "WARNING: No coverage data found"
+fi
+rm -rf "${COVDIR}"
+
+${KUBECTL_CMD} -n sippy-e2e delete secret regcred || true
+
+exit ${TEST_EXIT}

@@ -21,7 +21,8 @@ const (
 )
 
 const (
-	CustomFieldReleaseBlockerName          = "customfield_12319743"
+	// CustomFieldReleaseBlockerName Custom Field Ids will need to be updated after the migration to atlassian cloud
+	CustomFieldReleaseBlockerName          = "customfield_10847"
 	CustomFieldReleaseBlockerValueApproved = "Approved"
 )
 
@@ -153,4 +154,10 @@ type Component struct {
 	ProjectID           int    `json:"projectId"`
 	Archived            bool   `json:"archived"`
 	Deleted             bool   `json:"deleted"`
+}
+
+type SearchResponse struct {
+	Issues        []Issue `json:"issues"`
+	NextPageToken string  `json:"nextPageToken"`
+	IsLast        bool    `json:"isLast"`
 }

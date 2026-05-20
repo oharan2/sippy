@@ -355,7 +355,12 @@ type JobRun struct {
 	PullRequestLink       string              `json:"pull_request_link"`
 	PullRequestSHA        string              `json:"pull_request_sha"`
 	PullRequestAuthor     string              `json:"pull_request_author"`
+	Labels                pq.StringArray      `json:"labels" gorm:"type:text[]"`
+	Annotations           AnnotationMap       `json:"annotations,omitempty" gorm:"-"`
 }
+
+// AnnotationMap is a map[string]string for job run annotations.
+type AnnotationMap map[string]string
 
 func (run JobRun) GetFieldType(param string) ColumnType {
 	switch param {
@@ -372,6 +377,10 @@ func (run JobRun) GetFieldType(param string) ColumnType {
 	case "failed_test_names":
 		return ColumnTypeArray
 	case "flaked_test_names":
+		return ColumnTypeArray
+	case "ran_test_names":
+		return ColumnTypeArray
+	case "labels":
 		return ColumnTypeArray
 	case "variants":
 		return ColumnTypeArray
@@ -438,6 +447,8 @@ func (run JobRun) GetArrayValue(param string) ([]string, error) {
 		return run.FailedTestNames, nil
 	case "flaked_test_names":
 		return run.FlakedTestNames, nil
+	case "labels":
+		return run.Labels, nil
 	case "tags":
 		return run.Tags, nil
 	case "variants":
@@ -607,6 +618,7 @@ func (test Test) GetArrayValue(param string) ([]string, error) {
 // of this struct is suitable for use in a data table.
 type TestBQ struct {
 	ID        int            `json:"id,omitempty" bigquery:"id"`
+	TestID    string         `json:"test_id" bigquery:"test_id"`
 	Name      string         `json:"name" bigquery:"name"`
 	SuiteName string         `json:"suite_name" bigquery:"suite_name"`
 	Variant   string         `json:"variant,omitempty" bigquery:"variant"`
@@ -872,8 +884,19 @@ type JobAnalysisResult struct {
 }
 
 type TestOutput struct {
-	URL    string `json:"url"`
-	Output string `json:"output"`
+	ProwJobURL string `json:"url"`
+	Output     string `json:"output"`
+	TestName   string `json:"test_name,omitempty"`
+}
+
+type TestOutputBigQuery struct {
+	ProwJobURL  string     `json:"url"`
+	Output      string     `json:"output"`
+	TestName    string     `json:"test_name,omitempty"`
+	Success     bool       `json:"success"`
+	ProwJobName string     `json:"prowjob_name,omitempty"`
+	StartTime   *time.Time `json:"start_time,omitempty"`
+	FailedTests int        `json:"failed_tests"`
 }
 
 type ReleaseDates struct {
@@ -885,6 +908,7 @@ type Release struct { // this is the Release that goes out to the UI
 	ReleaseDates
 	PreviousRelease string                             `json:"previous_release"`
 	Capabilities    map[sippyv1.ReleaseCapability]bool `json:"capabilities"`
+	Product         string                             `json:"product"`
 }
 type Releases struct {
 	Releases          []string                `json:"releases"`
@@ -993,6 +1017,7 @@ type DisruptionReportRow struct {
 	Architecture             string  `json:"architecture"`
 	Relevance                int     `json:"relevance"`
 	FeatureSet               string  `json:"feature_set"`
+	OS                       string  `json:"os"`
 }
 
 type SippyViews struct {

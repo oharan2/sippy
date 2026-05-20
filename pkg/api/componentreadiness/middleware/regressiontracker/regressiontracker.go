@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/openshift/sippy/pkg/api/componentreadiness/middleware"
-	"github.com/openshift/sippy/pkg/apis/api/componentreport/bq"
+	"github.com/openshift/sippy/pkg/apis/api/componentreport/crstatus"
 	"github.com/openshift/sippy/pkg/apis/api/componentreport/crtest"
 	"github.com/openshift/sippy/pkg/apis/api/componentreport/reqopts"
 	"github.com/openshift/sippy/pkg/apis/api/componentreport/testdetails"
@@ -26,10 +26,6 @@ const (
 	// to adjust this to a smaller value so that, if a rate improvement is smaller than the openRegressionPityAdjustment,
 	// we still consider it regressed.
 	openRegressionPityAdjustment = -2
-	// openRegressionMinimumFailureAdjustment is used to adjust minimum failure requirement for regressed tests that have
-	// an open regression. The goal is to adjust this to a smaller value so that we will this test more strict than the ones
-	// without open regressions.
-	openRegressionMinimumFailureAdjustment = -1
 )
 
 var _ middleware.Middleware = &RegressionTracker{}
@@ -54,7 +50,7 @@ type RegressionTracker struct {
 	hasLoadedRegressions bool
 }
 
-func (r *RegressionTracker) Query(ctx context.Context, wg *sync.WaitGroup, allJobVariants crtest.JobVariants, baseStatusCh, sampleStatusCh chan map[string]bq.TestStatus, errCh chan error) {
+func (r *RegressionTracker) Query(ctx context.Context, wg *sync.WaitGroup, allJobVariants crtest.JobVariants, baseStatusCh, sampleStatusCh chan map[string]crstatus.TestStatus, errCh chan error) {
 	err := r.ensureRegressionsLoaded()
 	if err != nil {
 		errCh <- err
@@ -86,8 +82,7 @@ func (r *RegressionTracker) ensureRegressionsLoaded() error {
 
 func (r *RegressionTracker) PreAnalysis(testKey crtest.Identification, testStats *testdetails.TestComparison) error {
 	if len(r.openRegressions) > 0 {
-		view := r.openRegressions[0].View // grab view from first regression, they were queried only for sample release
-		or := FindOpenRegression(view, testKey.TestID, testKey.Variants, r.openRegressions)
+		or := FindOpenRegression(r.reqOptions.SampleRelease.Name, testKey.TestID, len(r.reqOptions.VariantOption.VariantCrossCompare) > 0, testKey.Variants, r.openRegressions)
 		if or != nil {
 			testStats.Regression = or
 
@@ -103,7 +98,6 @@ func (r *RegressionTracker) PreAnalysis(testKey crtest.Identification, testStats
 			// we were over 95% certain of a regression), we're going to only require 90% certainty to mark that test red.
 			testStats.RequiredConfidence = r.reqOptions.AdvancedOption.Confidence - openRegressionConfidenceAdjustment
 			testStats.PityAdjustment = openRegressionPityAdjustment
-			testStats.MinimumFailureAdjustment = openRegressionMinimumFailureAdjustment
 		}
 	}
 	return nil
@@ -120,8 +114,7 @@ func (r *RegressionTracker) PostAnalysis(testKey crtest.Identification, testStat
 		return err
 	}
 	if len(r.openRegressions) > 0 {
-		view := r.openRegressions[0].View // grab view from first regression, they were queried only for sample release
-		or := FindOpenRegression(view, testKey.TestID, testKey.Variants, r.openRegressions)
+		or := FindOpenRegression(r.reqOptions.SampleRelease.Name, testKey.TestID, len(r.reqOptions.VariantOption.VariantCrossCompare) > 0, testKey.Variants, r.openRegressions)
 		r.log.Debugf("checking regressions for %+v", testKey)
 		if or == nil {
 			return nil
@@ -175,23 +168,41 @@ func (r *RegressionTracker) PostAnalysis(testKey crtest.Identification, testStat
 }
 
 // FindOpenRegression scans the list of open regressions for any that match the given test summary.
-func FindOpenRegression(view string,
-	testID string,
+// The regressions list is expected to be pre-filtered by sample release (e.g. from ListOpenRegressions);
+// the sampleRelease check is redundant but kept for safety.
+func FindOpenRegression(sampleRelease, testID string,
+	crossCompare bool,
 	variants map[string]string,
 	regressions []*models.TestRegression) *models.TestRegression {
 
+	var matches []*models.TestRegression
 	for _, tr := range regressions {
-		if tr.View != view {
+		if sampleRelease != tr.Release {
 			continue
 		}
-
+		if tr.CrossCompare != crossCompare {
+			continue
+		}
 		// We compare test ID not name, as names can change.
 		if tr.TestID != testID {
 			continue
 		}
+		// Subset matching: check if ALL regression variants are present in the input variants.
+		// This allows the input to have additional variants beyond what the regression has,
+		// which supports db_column_groupby modifications that add new variants.
 		found := true
-		for key, value := range variants {
-			if value != findVariant(key, tr) {
+		for _, variant := range tr.Variants {
+			keyVal := strings.Split(variant, ":")
+			if len(keyVal) != 2 {
+				// Malformed variant, skip this regression
+				found = false
+				break
+			}
+			variantKey := keyVal[0]
+			variantValue := keyVal[1]
+
+			inputValue, exists := variants[variantKey]
+			if !exists || inputValue != variantValue {
 				found = false
 				break
 			}
@@ -200,21 +211,14 @@ func FindOpenRegression(view string,
 			continue
 		}
 		// If we made it this far, this appears to be a match:
-		return tr
+		matches = append(matches, tr)
+	}
+	if len(matches) > 0 {
+		return matches[0]
 	}
 	return nil
 }
 
-func findVariant(variantName string, testReg *models.TestRegression) string {
-	for _, v := range testReg.Variants {
-		keyVal := strings.Split(v, ":")
-		if keyVal[0] == variantName {
-			return keyVal[1]
-		}
-	}
-	return ""
-}
-
-func (r *RegressionTracker) PreTestDetailsAnalysis(testKey crtest.KeyWithVariants, status *bq.TestJobRunStatuses) error {
+func (r *RegressionTracker) PreTestDetailsAnalysis(testKey crtest.KeyWithVariants, status *crstatus.TestJobRunStatuses) error {
 	return nil
 }

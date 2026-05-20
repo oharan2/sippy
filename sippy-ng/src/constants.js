@@ -117,13 +117,13 @@ export const BOOKMARKS = {
   NO_NEVER_STABLE: {
     columnField: 'variants',
     not: true,
-    operatorValue: 'contains',
+    operatorValue: 'has entry',
     value: 'never-stable',
   },
   NO_AGGREGATED: {
     columnField: 'variants',
     not: true,
-    operatorValue: 'contains',
+    operatorValue: 'has entry',
     value: 'aggregated',
   },
   NO_STEP_GRAPH: {
@@ -184,3 +184,14 @@ export const BOOKMARKS = {
   },
   TRT: { columnField: 'tags', operatorValue: 'contains', value: 'trt' },
 }
+
+// Default filters applied when clicking "Tests" link in the sidebar
+export const DEFAULT_TEST_FILTERS = [
+  BOOKMARKS.RUN_7,
+  BOOKMARKS.NO_NEVER_STABLE,
+  BOOKMARKS.NO_AGGREGATED,
+  BOOKMARKS.WITHOUT_OVERALL_JOB_RESULT,
+  BOOKMARKS.NO_STEP_GRAPH,
+  BOOKMARKS.NO_OPENSHIFT_TESTS_SHOULD_WORK,
+  BOOKMARKS.NO_100_FLAKE,
+]

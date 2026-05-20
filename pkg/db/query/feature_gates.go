@@ -8,24 +8,31 @@ import (
 )
 
 func GetFeatureGatesFromDB(dbc *gorm.DB, release string, filterOpts *filter.FilterOptions) ([]api.FeatureGate, error) {
-	// Get tests by feature gate
+	// Get tests by feature gate.
 	// Install related FG is special and is covered by install should succeed case.
-	subQuery := dbc.Table("prow_test_report_7d_matview").
-		Select(`name, release, regexp_matches(name, '\[(FeatureGate|OCPFeatureGate):([^\]]+)\]|install should succeed') AS match`).
-		Where("release = ?", release)
+	// Pre-filter with LIKE to avoid running expensive regex on every row.
+	// regexp_matches(..., 'g') counts every tag in the name, not only the first.
+	byTag := dbc.Table("prow_test_report_7d_matview AS ptr").
+		Select("ptr.name, ptr.release, (m.match)[2] AS gate_name").
+		Joins(`CROSS JOIN LATERAL regexp_matches(ptr.name, '\[(FeatureGate|OCPFeatureGate):([^\]]+)\]', 'g') AS m(match)`).
+		Where("ptr.release = ? AND ptr.name LIKE ?", release, "%FeatureGate:%")
+	byInstall := dbc.Table("prow_test_report_7d_matview").
+		Select("name, release, NULL::text AS gate_name").
+		Where("release = ? AND name LIKE ?", release, "%install should succeed%")
+	subQuery := dbc.Raw("? UNION ALL ?", byTag, byInstall)
 
-	// Figure out the first release we ever saw a FG
-	firstSeenQuery := dbc.Table("feature_gates").
-		Select(`
+	// Figure out the first release we ever saw a FG.
+	// Use DISTINCT ON to return exactly one row per feature gate (the earliest release).
+	firstSeenQuery := dbc.Raw(`
+		SELECT DISTINCT ON (feature_gate)
 			feature_gate,
-			MIN(release) OVER (
-				PARTITION BY feature_gate 
-				ORDER BY string_to_array(release, '.')::int[] ASC
-			) AS first_seen_in,
-			CAST((string_to_array(MIN(release) OVER (PARTITION BY feature_gate), '.'))[1] AS INT) AS first_seen_in_major,
-			CAST((string_to_array(MIN(release) OVER (PARTITION BY feature_gate), '.'))[2] AS INT) AS first_seen_in_minor
-		`).
-		Where("status = 'enabled'")
+			release AS first_seen_in,
+			CAST((string_to_array(release, '.'))[1] AS INT) AS first_seen_in_major,
+			CAST((string_to_array(release, '.'))[2] AS INT) AS first_seen_in_minor
+		FROM feature_gates
+		WHERE status = 'enabled'
+		ORDER BY feature_gate, string_to_array(release, '.')::int[] ASC
+	`)
 
 	query := dbc.Table("feature_gates AS fg").
 		Select(`
@@ -38,7 +45,8 @@ func GetFeatureGatesFromDB(dbc *gorm.DB, release string, filterOpts *filter.Filt
 			COUNT(DISTINCT mt.name) AS unique_test_count,
 			ARRAY_AGG(DISTINCT fg.feature_set || ':' || fg.topology) AS enabled
 		`).
-		Joins("LEFT JOIN (?) AS mt ON fg.feature_gate = mt.match[2] OR (fg.feature_gate LIKE '%Install%' AND name LIKE '%install should succeed%')", subQuery).
+		Joins(`LEFT JOIN (?) AS mt ON fg.feature_gate = mt.gate_name
+			OR (mt.gate_name IS NULL AND fg.feature_gate LIKE '%Install%' AND mt.name LIKE '%install should succeed%')`, subQuery).
 		Joins("LEFT JOIN (?) AS fs ON fg.feature_gate = fs.feature_gate", firstSeenQuery).
 		Where("fg.release = ? AND fg.status = 'enabled'", release).
 		Group("fg.feature_gate, fg.release, fs.first_seen_in, fs.first_seen_in_major, fs.first_seen_in_minor").

@@ -11,10 +11,12 @@ import (
 	"cloud.google.com/go/bigquery"
 	"github.com/openshift/sippy/pkg/api"
 	"github.com/openshift/sippy/pkg/api/componentreadiness"
-	"github.com/openshift/sippy/pkg/apis/cache"
 	sippyv1 "github.com/openshift/sippy/pkg/apis/sippy/v1"
-	"github.com/openshift/sippy/pkg/dataloader/crcacheloader"
+	"github.com/openshift/sippy/pkg/dataloader/regressioncacheloader"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/push"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -58,9 +60,18 @@ type LoadFlags struct {
 	ModeFlags               *flags.ModeFlags
 	CacheFlags              *flags.CacheFlags
 	ComponentReadinessFlags *flags.ComponentReadinessFlags
+	JiraFlags               *flags.JiraFlags
 	JobVariantsInputFile    string
 	LogLevel                string
+	ProwLoadSince           string
+	SkipMatviewRefresh      bool
 }
+
+// want a single total load and refresh time
+var loadMetricGauge = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "sippy_data_load_refresh_minutes",
+	Help: "Minutes to load and refresh db",
+})
 
 func NewLoadFlags() *LoadFlags {
 	return &LoadFlags{
@@ -72,6 +83,7 @@ func NewLoadFlags() *LoadFlags {
 		ModeFlags:               flags.NewModeFlags(),
 		CacheFlags:              flags.NewCacheFlags(),
 		ComponentReadinessFlags: flags.NewComponentReadinessFlags(),
+		JiraFlags:               flags.NewJiraFlags(),
 	}
 }
 
@@ -84,6 +96,7 @@ func (f *LoadFlags) BindFlags(fs *pflag.FlagSet) {
 	f.ModeFlags.BindFlags(fs)
 	f.CacheFlags.BindFlags(fs)
 	f.ComponentReadinessFlags.BindFlags(fs)
+	f.JiraFlags.BindFlags(fs)
 
 	fs.BoolVar(&f.InitDatabase, "init-database", false, "Migrate the DB before loading")
 	fs.StringArrayVar(&f.Loaders, "loader", []string{"prow", "releases", "jira", "github", "bugs", "test-mapping", "feature-gates"}, "Which data sources to use for data loading")
@@ -91,6 +104,8 @@ func (f *LoadFlags) BindFlags(fs *pflag.FlagSet) {
 	fs.StringArrayVar(&f.Architectures, "arch", f.Architectures, "Which architectures to load (one per arg instance)")
 	fs.StringVar(&f.JobVariantsInputFile, "job-variants-input-file", "expected-job-variants.json", "JSON input file for the job-variants loader")
 	fs.StringVar(&f.LogLevel, "log-level", "info", "Log level")
+	fs.StringVar(&f.ProwLoadSince, "prow-load-since", "", "Override how far back to load prow jobs (e.g. 2024-01-15T00:00:00Z or 72h for 72 hours ago)")
+	fs.BoolVar(&f.SkipMatviewRefresh, "skip-matview-refresh", false, "Skip refreshing materialized views after loading")
 }
 
 // nolint:gocyclo
@@ -129,14 +144,21 @@ func NewLoadCommand() *cobra.Command {
 				}
 			}
 
+			// likewise get a cache client if possible, though some things operate without it.
 			cacheClient, cacheErr := f.CacheFlags.GetCacheClient()
+			if cacheErr != nil {
+				log.WithError(cacheErr).Info("cache client not available, proceeding without caching")
+				cacheClient = nil // error hygiene, since we pass this down to quite a few functions
+			}
+
 			releaseConfigs := []sippyv1.Release{}
 
-			// initializing a different bigquery client to the normal one
-			bqc, bigqueryErr := bqcachedclient.New(ctx,
+			// initializing a bigquery client different from the normal one
+			opCtx, ctx := bqcachedclient.OpCtxForCronEnv(ctx, "load")
+			bqc, bigqueryErr := bqcachedclient.New(
+				ctx, opCtx, cacheClient,
 				f.GoogleCloudFlags.ServiceAccountCredentialFile,
-				f.BigQueryFlags.BigQueryProject,
-				f.BigQueryFlags.BigQueryDataset, cacheClient, f.BigQueryFlags.ReleasesTable)
+				f.BigQueryFlags.BigQueryProject, f.BigQueryFlags.BigQueryDataset, f.BigQueryFlags.ReleasesTable)
 			if bigqueryErr == nil {
 				if f.CacheFlags.EnablePersistentCaching {
 					bqc = f.CacheFlags.DecorateBiqQueryClientWithPersistentCache(bqc)
@@ -154,17 +176,30 @@ func NewLoadCommand() *cobra.Command {
 			}
 
 			var refreshMatviews bool
+			var promPusher *push.Pusher
+			if pushgateway := os.Getenv("SIPPY_PROMETHEUS_PUSHGATEWAY"); pushgateway != "" {
+				promPusher = push.New(pushgateway, "sippy-prow-job-loader")
+				promPusher.Collector(loadMetricGauge)
+			}
 
+			var regressionCacheAdded bool
 			for _, l := range f.Loaders {
-				if l == "component-readiness-cache" {
+				// TODO: remove "component-readiness-cache" and "regression-tracker" once the cronjob
+				// manifests are updated to use "regression-cache".
+				if l == "component-readiness-cache" || l == "regression-tracker" || l == "regression-cache" {
+					if regressionCacheAdded {
+						continue
+					}
+					regressionCacheAdded = true
+
 					if bigqueryErr != nil {
-						return errors.Wrap(bigqueryErr, "CRITICAL error getting BigQuery client which prevents cache loading")
+						return errors.Wrap(bigqueryErr, "CRITICAL error getting BigQuery client which prevents regression-cache loading")
 					}
 					if dbErr != nil {
-						return dbErr
+						return errors.Wrap(dbErr, "CRITICAL error getting postgres client which prevents regression-cache loading")
 					}
 					if cacheErr != nil {
-						return errors.Wrap(err, "couldn't get cache client")
+						return errors.Wrap(cacheErr, "couldn't get cache client")
 					}
 					if f.CacheFlags.RedisURL == "" {
 						return fmt.Errorf("--redis-url is required")
@@ -177,9 +212,23 @@ func NewLoadCommand() *cobra.Command {
 					if len(views.ComponentReadiness) == 0 {
 						return fmt.Errorf("no component readiness views provided")
 					}
-					loaders = append(loaders, crcacheloader.New(dbc, cacheClient, bqc, config, views, releaseConfigs,
-						f.ComponentReadinessFlags.CRTimeRoundingFactor))
 
+					jiraClient, jErr := f.JiraFlags.GetJiraClient()
+					if jErr != nil {
+						return errors.Wrap(jErr, "CRITICAL error getting jira client which prevents regression tracking")
+					}
+					regressionStore := componentreadiness.NewPostgresRegressionStore(dbc, jiraClient)
+
+					rcl, err := regressioncacheloader.New(
+						dbc, bqc, config, views.ComponentReadiness, releaseConfigs,
+						f.ComponentReadinessFlags.CRTimeRoundingFactor,
+						regressionStore,
+						config.ComponentReadinessConfig.VariantJunitTableOverrides,
+					)
+					if err != nil {
+						return errors.Wrap(err, "error creating regression cache loader")
+					}
+					loaders = append(loaders, rcl)
 				}
 
 				if l == "releases" {
@@ -195,7 +244,7 @@ func NewLoadCommand() *cobra.Command {
 					if dbErr != nil {
 						return dbErr
 					}
-					prowLoader, err := f.prowLoader(ctx, dbc, config, releaseConfigs)
+					prowLoader, err := f.prowLoader(ctx, dbc, config, releaseConfigs, promPusher)
 					if err != nil {
 						return err
 					}
@@ -269,35 +318,6 @@ func NewLoadCommand() *cobra.Command {
 					loaders = append(loaders, fgLoader)
 				}
 
-				if l == "regression-tracker" {
-					if bigqueryErr != nil {
-						return errors.Wrap(bigqueryErr, "CRITICAL error getting BigQuery client which prevents regression tracking")
-					}
-					if dbErr != nil {
-						return errors.Wrap(dbErr, "CRITICAL error getting postgres client which prevents regression tracking")
-					}
-					cacheOpts := cache.RequestOptions{CRTimeRoundingFactor: f.ComponentReadinessFlags.CRTimeRoundingFactor}
-
-					views, err := f.ComponentReadinessFlags.ParseViewsFile()
-					if err != nil {
-						return errors.Wrap(err, "error parsing views file")
-					}
-					if len(views.ComponentReadiness) == 0 {
-						return fmt.Errorf("no component readiness views provided")
-					}
-					releases, err := api.GetReleases(context.TODO(), bqc, false)
-					if err != nil {
-						log.WithError(err).Fatal("error querying releases")
-					}
-
-					regressionTracker := componentreadiness.NewRegressionTracker(
-						bqc, dbc, cacheOpts, releases,
-						componentreadiness.NewPostgresRegressionStore(dbc),
-						views.ComponentReadiness,
-						config.ComponentReadinessConfig.VariantJunitTableOverrides,
-						false)
-					loaders = append(loaders, regressionTracker)
-				}
 			}
 
 			// Run loaders with the metrics wrapper
@@ -310,9 +330,21 @@ func NewLoadCommand() *cobra.Command {
 			elapsed := time.Since(start)
 			log.WithField("elapsed", elapsed).Info("database load complete")
 
-			pinnedTime := f.DBFlags.GetPinnedTime()
-			if refreshMatviews {
-				sippyserver.RefreshData(dbc, pinnedTime, false)
+			if refreshMatviews && !f.SkipMatviewRefresh {
+				sippyserver.RefreshData(dbc, cacheClient, false)
+			}
+
+			elapsed = time.Since(start)
+			log.WithField("elapsed", elapsed).Info("load and refresh complete")
+
+			if promPusher != nil {
+				loadMetricGauge.Set(float64(elapsed.Minutes()))
+				log.Info("pushing metrics to prometheus gateway")
+				if err := promPusher.Add(); err != nil {
+					log.WithError(err).Error("could not push to prometheus pushgateway")
+				} else {
+					log.Info("successfully pushed metrics to prometheus gateway")
+				}
 			}
 
 			if len(allErrs) > 0 {
@@ -362,13 +394,14 @@ func (f *LoadFlags) jobVariantsLoader(ctx context.Context) (dataloader.DataLoade
 	}
 
 	log.Infof("Loaded expected job variant data from: %s", inputFile)
-	syncer := variantregistry.NewJobVariantsLoader(bigQueryClient, f.BigQueryFlags.BigQueryProject,
+	opCtx, _ := bqcachedclient.OpCtxForCronEnv(ctx, "load")
+	syncer := variantregistry.NewJobVariantsLoader(bigQueryClient, opCtx, f.BigQueryFlags.BigQueryProject,
 		f.BigQueryFlags.BigQueryDataset, "job_variants", expectedVariants)
 	return syncer, nil
 
 }
 
-func (f *LoadFlags) prowLoader(ctx context.Context, dbc *db.DB, sippyConfig *v1.SippyConfig, releaseConfigs []sippyv1.Release) (dataloader.DataLoader, error) {
+func (f *LoadFlags) prowLoader(ctx context.Context, dbc *db.DB, sippyConfig *v1.SippyConfig, releaseConfigs []sippyv1.Release, promPusher *push.Pusher) (dataloader.DataLoader, error) {
 	gcsClient, err := gcs.NewGCSClient(ctx,
 		f.GoogleCloudFlags.ServiceAccountCredentialFile,
 		f.GoogleCloudFlags.OAuthClientCredentialFile,
@@ -378,7 +411,10 @@ func (f *LoadFlags) prowLoader(ctx context.Context, dbc *db.DB, sippyConfig *v1.
 		return nil, err
 	}
 
-	bigQueryClient, err := bqcachedclient.New(ctx, f.GoogleCloudFlags.ServiceAccountCredentialFile, f.BigQueryFlags.BigQueryProject, f.BigQueryFlags.BigQueryDataset, nil, f.BigQueryFlags.ReleasesTable)
+	opCtx, ctx := bqcachedclient.OpCtxForCronEnv(ctx, "load")
+	bigQueryClient, err := bqcachedclient.New(
+		ctx, opCtx, nil,
+		f.GoogleCloudFlags.ServiceAccountCredentialFile, f.BigQueryFlags.BigQueryProject, f.BigQueryFlags.BigQueryDataset, f.BigQueryFlags.ReleasesTable)
 	if err != nil {
 		log.WithError(err).Error("CRITICAL error getting BigQuery client which prevents importing prow jobs")
 		return nil, err
@@ -405,6 +441,20 @@ func (f *LoadFlags) prowLoader(ctx context.Context, dbc *db.DB, sippyConfig *v1.
 		}
 	}
 
+	syntheticReleaseJobOverrides, err := variantregistry.BuildSyntheticReleaseJobOverrides(sippyConfig.Releases, releaseConfigs)
+	if err != nil {
+		return nil, fmt.Errorf("error building synthetic release job overrides: %w", err)
+	}
+
+	var loadSince *time.Time
+	if f.ProwLoadSince != "" {
+		t, err := parseProwLoadSince(f.ProwLoadSince)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --prow-load-since value %q: %w", f.ProwLoadSince, err)
+		}
+		loadSince = &t
+	}
+
 	return prowloader.New(
 		ctx,
 		dbc,
@@ -415,5 +465,21 @@ func (f *LoadFlags) prowLoader(ctx context.Context, dbc *db.DB, sippyConfig *v1.
 		f.ModeFlags.GetSyntheticTestManager(),
 		releases,
 		sippyConfig,
-		ghCommenter), nil
+		ghCommenter,
+		promPusher,
+		loadSince,
+		syntheticReleaseJobOverrides), nil
+}
+
+// parseProwLoadSince parses a time value that is either an absolute RFC3339 timestamp
+// or a Go duration string (e.g. "72h") interpreted as a duration ago from now.
+func parseProwLoadSince(val string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339, val); err == nil {
+		return t, nil
+	}
+	d, err := time.ParseDuration(val)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("must be an RFC3339 timestamp (e.g. 2024-01-15T00:00:00Z) or a duration (e.g. 72h)")
+	}
+	return time.Now().Add(-d), nil
 }

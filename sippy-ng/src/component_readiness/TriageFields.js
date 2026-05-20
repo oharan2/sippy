@@ -62,7 +62,7 @@ export default function TriageFields({
   handleAddToExistingTriage,
 }) {
   const classes = useStyles()
-  const { view } = useContext(CompReadyVarsContext)
+  const { view, sampleRelease } = useContext(CompReadyVarsContext)
 
   const [matchingTriages, setMatchingTriages] = React.useState([])
   const [triageValidationErrors, setTriageValidationErrors] = React.useState([])
@@ -115,6 +115,7 @@ export default function TriageFields({
     if (triageEntryData.type === 'type') {
       validationErrors.push('invalid type, please make a selection')
     }
+    // validation will require the new atlassian jira URL going forward
     if (!triageEntryData.url.startsWith(jiraUrlPrefix)) {
       validationErrors.push('invalid url, should begin with ' + jiraUrlPrefix)
     }
@@ -188,7 +189,11 @@ export default function TriageFields({
           handleFormCompletion()
         } else {
           response.json().then((createdTriage) => {
-            fetch(`${getTriagesAPIUrl(createdTriage.id)}/matches?view=${view}`)
+            fetch(
+              `${getTriagesAPIUrl(createdTriage.id)}/matches?release=${
+                sampleRelease || ''
+              }`
+            )
               .then((matchesResponse) => {
                 if (matchesResponse.status === 200) {
                   return matchesResponse.json()
@@ -245,6 +250,7 @@ export default function TriageFields({
           value={triageEntryData.description}
           onChange={handleTriageChange}
           fullWidth
+          helperText="If this triage is linked to a Jira bug in Sippy, this value may be replaced by the Jira issue summary when bug data is refreshed."
         />
         <Select
           name="type"

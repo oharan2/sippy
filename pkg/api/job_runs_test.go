@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -219,9 +220,11 @@ func TestRunJobAnalysis(t *testing.T) {
 
 			for _, t := range tests {
 				fakeProwJobRun.Tests = append(fakeProwJobRun.Tests, models.ProwJobRunTest{
-					Test:   models.Test{Name: t.Name},
-					Suite:  models.Suite{Name: t.SuiteName},
-					Status: 12,
+					ProwJobID:         fakeProwJobRun.ProwJobID,
+					ProwJobRunRelease: fakeProwJobRun.ProwJobRelease,
+					Test:              models.Test{Name: t.Name},
+					Suite:             models.Suite{Name: t.SuiteName},
+					Status:            12,
 				})
 			}
 
@@ -252,7 +255,7 @@ func TestRunJobAnalysis(t *testing.T) {
 				}
 			}
 
-			result, err := runJobRunAnalysis(nil, fakeProwJobRun, "4.12", 5, false, tc.jobNames, log.WithField("jobRunID", "test"), testResultsJobNamesLookupFunc, testResultsVariantsLookupFunc, false)
+			result, err := runJobRunAnalysis(context.TODO(), nil, fakeProwJobRun, "4.12", 5, false, tc.jobNames, log.WithField("jobRunID", "test"), testResultsJobNamesLookupFunc, testResultsVariantsLookupFunc, false)
 			require.NoError(t, err)
 			assert.Equal(t, len(tc.expectedTestRisks), len(result.Tests))
 			for testName, expectedRisk := range tc.expectedTestRisks {
@@ -288,13 +291,14 @@ func buildFakeProwJobRun() *models.ProwJobRun {
 			},
 		},
 		ProwJobID:             1000000000,
+		ProwJobRelease:        "4.12",
 		URL:                   "https://example.com/run/1000000000",
 		Tests:                 []models.ProwJobRunTest{}, // will be populated in the test cases
 		TestCount:             5,
 		Failed:                true,
 		InfrastructureFailure: false,
 		Succeeded:             false,
-		OverallResult:         "f",
+		OverallResult:         "F",
 	}
 	return fakeProwJobRun
 }

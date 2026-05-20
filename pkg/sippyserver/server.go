@@ -1,6 +1,7 @@
 package sippyserver
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,22 +11,25 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/signal"
 	"regexp"
+	sorting "sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 
+	"github.com/openshift/sippy/pkg/api/componentreadiness/dataprovider"
 	"github.com/openshift/sippy/pkg/api/componentreadiness/utils"
 	"github.com/openshift/sippy/pkg/api/jobartifacts"
 	"github.com/openshift/sippy/pkg/apis/api/componentreport"
 	"github.com/openshift/sippy/pkg/apis/api/componentreport/crview"
-	"github.com/openshift/sippy/pkg/util/sets"
-
+	"github.com/openshift/sippy/pkg/bigquery/bqlabel"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -44,10 +48,12 @@ import (
 
 	"github.com/openshift/sippy/pkg/api"
 	"github.com/openshift/sippy/pkg/api/componentreadiness"
+	"github.com/openshift/sippy/pkg/api/jobrunevents"
 	"github.com/openshift/sippy/pkg/api/jobrunintervals"
 	apitype "github.com/openshift/sippy/pkg/apis/api"
 	"github.com/openshift/sippy/pkg/apis/cache"
-	"github.com/openshift/sippy/pkg/bigquery"
+	sippyv1 "github.com/openshift/sippy/pkg/apis/sippy/v1"
+	sippybq "github.com/openshift/sippy/pkg/bigquery"
 	"github.com/openshift/sippy/pkg/db"
 	"github.com/openshift/sippy/pkg/db/models"
 	"github.com/openshift/sippy/pkg/db/query"
@@ -77,7 +83,8 @@ func NewServer(
 	dbClient *db.DB,
 	gcsClient *storage.Client,
 	gcsBucket string,
-	bigQueryClient *bigquery.Client,
+	bigQueryClient *sippybq.Client,
+	crDataProvider dataprovider.DataProvider,
 	pinnedDateTime *time.Time,
 	cacheClient cache.Cache,
 	crTimeRoundingFactor time.Duration,
@@ -99,6 +106,7 @@ func NewServer(
 		static:               static,
 		db:                   dbClient,
 		bigQueryClient:       bigQueryClient,
+		crDataProvider:       crDataProvider,
 		pinnedDateTime:       pinnedDateTime,
 		gcsClient:            gcsClient,
 		gcsBucket:            gcsBucket,
@@ -111,8 +119,13 @@ func NewServer(
 		jiraClient:           jiraClient,
 	}
 
-	if bigQueryClient != nil {
-		go componentreadiness.GetComponentTestVariantsFromBigQuery(context.Background(), bigQueryClient)
+	if crDataProvider != nil {
+		go func() {
+			_, errs := componentreadiness.GetComponentTestVariants(context.Background(), server.crDataProvider)
+			if len(errs) > 0 {
+				log.WithField("errors", errs).Warn("errors during component test variants prefetch")
+			}
+		}()
 	}
 
 	return server
@@ -130,6 +143,16 @@ var allMatViewsRefreshMetric = promauto.NewHistogram(prometheus.HistogramOpts{
 	Buckets: []float64{5000, 10000, 30000, 60000, 300000, 600000, 1200000, 1800000, 2400000, 3000000, 3600000},
 })
 
+var matViewUniqueNumberOfTests = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "sippy_matviews_unique_number_of_tests",
+	Help: "Total number of tests based on lookback days",
+}, []string{"lookback_days"})
+
+var matViewUniqueNumberOfJobRuns = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "sippy_matviews_unique_number_of_job_runs",
+	Help: "Total number of job runs based on lookback days",
+}, []string{"lookback_days"})
+
 type Server struct {
 	mode                 Mode
 	listenAddr           string
@@ -141,7 +164,8 @@ type Server struct {
 	static               fs.FS
 	httpServer           *http.Server
 	db                   *db.DB
-	bigQueryClient       *bigquery.Client
+	bigQueryClient       *sippybq.Client
+	crDataProvider       dataprovider.DataProvider
 	pinnedDateTime       *time.Time
 	gcsClient            *storage.Client
 	gcsBucket            string
@@ -153,6 +177,65 @@ type Server struct {
 	enableWriteAPIs      bool
 	chatAPIURL           string
 	jiraClient           *jira.Client
+	rateLimiters         map[string]*rateLimiter
+}
+
+// getReleases returns release data, preferring the BigQuery client with caching
+// when available, falling back to the data provider for mock mode.
+func (s *Server) getReleases(ctx context.Context, forceRefresh ...bool) ([]sippyv1.Release, error) {
+	if s.bigQueryClient != nil {
+		refresh := len(forceRefresh) > 0 && forceRefresh[0]
+		return api.GetReleases(ctx, s.bigQueryClient, refresh)
+	}
+	if s.crDataProvider != nil {
+		return s.crDataProvider.QueryReleases(ctx)
+	}
+	return nil, fmt.Errorf("no data source available for releases")
+}
+
+type rateLimiter struct {
+	mu           sync.Mutex
+	requestTimes []time.Time
+	maxRequests  int
+	period       time.Duration
+}
+
+func (rl *rateLimiter) allow() bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+
+	// Remove expired request times
+	cutoff := now.Add(-rl.period)
+	var validTimes []time.Time
+	for _, t := range rl.requestTimes {
+		if t.After(cutoff) {
+			validTimes = append(validTimes, t)
+		}
+	}
+	rl.requestTimes = validTimes
+
+	log.Debugf("Rate limiter: now=%s, cutoff=%s, valid_requests=%d/%d, oldest=%v",
+		now.Format("15:04:05"), cutoff.Format("15:04:05"), len(rl.requestTimes), rl.maxRequests,
+		func() string {
+			if len(rl.requestTimes) > 0 {
+				return rl.requestTimes[0].Format("15:04:05")
+			}
+			return "none"
+		}())
+
+	// Check if we're at the limit
+	if len(rl.requestTimes) >= rl.maxRequests {
+		// Reject without recording - only successful requests count toward the limit
+		log.Debugf("Rate limit REJECTED: %d requests in window (max %d)", len(rl.requestTimes), rl.maxRequests)
+		return false
+	}
+
+	// Record this request as successful - it counts toward the rate limit
+	rl.requestTimes = append(rl.requestTimes, now)
+	log.Debugf("Rate limit ALLOWED: recorded request at %s", now.Format("15:04:05"))
+	return true
 }
 
 func (s *Server) GetReportEnd() time.Time {
@@ -165,12 +248,14 @@ func (s *Server) GetReportEnd() time.Time {
 //
 // refreshMatviewOnlyIfEmpty is used on startup to indicate that we want to do an initial refresh *only* if
 // the views appear to be empty.
-func refreshMaterializedViews(dbc *db.DB, refreshMatviewOnlyIfEmpty bool) {
+func refreshMaterializedViews(dbc *db.DB, cacheClient cache.Cache, refreshMatviewOnlyIfEmpty bool) {
 	var promPusher *push.Pusher
 	if pushgateway := os.Getenv("SIPPY_PROMETHEUS_PUSHGATEWAY"); pushgateway != "" {
 		promPusher = push.New(pushgateway, "sippy-matviews")
 		promPusher.Collector(matViewRefreshMetric)
 		promPusher.Collector(allMatViewsRefreshMetric)
+		promPusher.Collector(matViewUniqueNumberOfTests)
+		promPusher.Collector(matViewUniqueNumberOfJobRuns)
 	}
 
 	log.Info("refreshing materialized views")
@@ -180,18 +265,62 @@ func refreshMaterializedViews(dbc *db.DB, refreshMatviewOnlyIfEmpty bool) {
 		log.Info("skipping materialized view refresh as server has no db connection provided")
 		return
 	}
+
+	wg := sync.WaitGroup{}
+	// get our test count metrics before we begin the refresh as the matview queries dramatically impact CPU
+	// 14 == 7 day lookback with comparison to previous 7 days
+	// 9 == 2 day lookback with comparison to 7 previous days
+	lookbacks := []int{14, 9}
+	for _, lookback := range lookbacks {
+		wg.Add(1)
+		go func(lookback int) {
+			jobRunsCount, testIDsCount, err := api.GetJobRunTestsCountByLookback(dbc, lookback)
+			if err != nil {
+				log.Errorf("Error getting prow job run test lookback counts: %v", err)
+			} else {
+				log.Infof("prow job run test ids lookback (%d) count: %d", lookback, testIDsCount)
+				matViewUniqueNumberOfTests.WithLabelValues(fmt.Sprintf("%d", lookback)).Set(float64(testIDsCount))
+				log.Infof("prow job run ids lookback (%d) count: %d", lookback, jobRunsCount)
+				matViewUniqueNumberOfJobRuns.WithLabelValues(fmt.Sprintf("%d", lookback)).Set(float64(jobRunsCount))
+			}
+			wg.Done()
+		}(lookback)
+	}
+	wg.Wait()
 	// create a channel for work "tasks"
 	ch := make(chan string)
 
-	wg := sync.WaitGroup{}
+	wg = sync.WaitGroup{}
 
 	// allow concurrent workers for refreshing matviews in parallel
 	for t := 0; t < 2; t++ {
 		wg.Add(1)
-		go refreshMatview(dbc, refreshMatviewOnlyIfEmpty, ch, &wg)
+		go refreshMatview(dbc, cacheClient, refreshMatviewOnlyIfEmpty, ch, &wg)
 	}
 
-	for _, pmv := range db.PostgresMatViews {
+	// Sort materialized views so prow_test_report_2d_matview runs last to avoid CPU overload
+	sortedMatViews := make([]db.PostgresView, len(db.PostgresMatViews))
+	copy(sortedMatViews, db.PostgresMatViews)
+	sorting.SliceStable(sortedMatViews, func(i, j int) bool {
+		// Move prow_test_report_2d_matview to the end
+		if sortedMatViews[i].Name == "prow_test_report_2d_matview" {
+			return false
+		}
+		if sortedMatViews[j].Name == "prow_test_report_2d_matview" {
+			return true
+		}
+
+		// Move prow_test_report_7d_matview to the beginning
+		if sortedMatViews[i].Name == "prow_test_report_7d_matview" {
+			return true
+		}
+		if sortedMatViews[j].Name == "prow_test_report_7d_matview" {
+			return false
+		}
+		return false
+	})
+
+	for _, pmv := range sortedMatViews {
 		ch <- pmv.Name
 	}
 
@@ -212,7 +341,7 @@ func refreshMaterializedViews(dbc *db.DB, refreshMatviewOnlyIfEmpty bool) {
 	}
 }
 
-func refreshMatview(dbc *db.DB, refreshMatviewOnlyIfEmpty bool, ch chan string, wg *sync.WaitGroup) {
+func refreshMatview(dbc *db.DB, cacheClient cache.Cache, refreshMatviewOnlyIfEmpty bool, ch chan string, wg *sync.WaitGroup) {
 
 	for matView := range ch {
 		start := time.Now()
@@ -243,24 +372,37 @@ func refreshMatview(dbc *db.DB, refreshMatviewOnlyIfEmpty bool, ch chan string, 
 			} else {
 				elapsed := time.Since(start)
 				tmpLog.WithField("elapsed", elapsed).Info("refreshed materialized view")
+				recordMatviewRefreshTime(cacheClient, matView, tmpLog)
 				matViewRefreshMetric.WithLabelValues(matView).Observe(float64(elapsed.Milliseconds()))
 			}
 
 		} else {
 			elapsed := time.Since(start)
 			tmpLog.WithField("elapsed", elapsed).Info("refreshed materialized view concurrently")
+			recordMatviewRefreshTime(cacheClient, matView, tmpLog)
 			matViewRefreshMetric.WithLabelValues(matView).Observe(float64(elapsed.Milliseconds()))
 		}
 	}
 	wg.Done()
 }
 
-func RefreshData(dbc *db.DB, pinnedDateTime *time.Time, refreshMatviewsOnlyIfEmpty bool) {
+func recordMatviewRefreshTime(cacheClient cache.Cache, matView string, tmpLog *log.Entry) {
+	if cacheClient == nil {
+		return
+	}
+	// note that a matview refresh uses the source data that is present at the *start* of the refresh,
+	// but the matview data updates may not be available to read until it completes; so we invalidate the cache with
+	// the timestamp *after* the refresh completes.
+	ts := []byte(time.Now().UTC().Format(time.RFC3339))
+	if err := cacheClient.Set(context.Background(), api.RefreshMatviewKey(matView), ts, 24*time.Hour); err != nil {
+		tmpLog.WithError(err).Warn("failed to record matview refresh timestamp in cache")
+	}
+}
+
+func RefreshData(dbc *db.DB, cacheClient cache.Cache, refreshMatviewsOnlyIfEmpty bool) {
 	log.Infof("Refreshing data")
-
-	refreshMaterializedViews(dbc, refreshMatviewsOnlyIfEmpty)
-
-	log.Infof("Refresh complete")
+	refreshMaterializedViews(dbc, cacheClient, refreshMatviewsOnlyIfEmpty)
+	log.Info("Refresh complete")
 }
 
 func (s *Server) hasCapabilities(capabilities []string) bool {
@@ -285,7 +427,7 @@ func (s *Server) determineCapabilities() {
 		capabilities = append(capabilities, OpenshiftCapability)
 	}
 
-	if s.bigQueryClient != nil {
+	if s.bigQueryClient != nil || s.crDataProvider != nil {
 		capabilities = append(capabilities, ComponentReadinessCapability)
 	}
 	if s.db != nil {
@@ -505,6 +647,18 @@ func (s *Server) jsonReleaseHealthReport(w http.ResponseWriter, req *http.Reques
 func (s *Server) jsonPayloadDiff(w http.ResponseWriter, req *http.Request) {
 	fromPayload := param.SafeRead(req, "fromPayload")
 	toPayload := param.SafeRead(req, "toPayload")
+
+	// If fromPayload is not specified, look up the previous payload in the same stream
+	if fromPayload == "" && toPayload != "" {
+		prevPayload, err := query.GetPreviousPayload(s.db.DB, toPayload)
+		if err != nil {
+			log.WithError(err).Error("error looking up previous payload")
+			failureResponse(w, http.StatusBadRequest, "could not find previous payload for: "+toPayload)
+			return
+		}
+		fromPayload = prevPayload.ReleaseTag
+	}
+
 	results, err := api.GetPayloadDiffPullRequests(s.db, fromPayload, toPayload)
 
 	if err != nil {
@@ -637,12 +791,142 @@ func (s *Server) jsonTestOutputsFromDB(w http.ResponseWriter, req *http.Request)
 	api.RespondWithJSON(http.StatusOK, w, outputs)
 }
 
-func (s *Server) jsonComponentTestVariantsFromBigQuery(w http.ResponseWriter, req *http.Request) {
-	if s.bigQueryClient == nil {
-		failureResponse(w, http.StatusBadRequest, "component report API is only available when google-service-account-credential-file is configured")
+func (s *Server) jsonGetRecentTestFailures(w http.ResponseWriter, req *http.Request) {
+	release := s.getParamOrFail(w, req, "release")
+	if release == "" {
 		return
 	}
-	outputs, errs := componentreadiness.GetComponentTestVariantsFromBigQuery(req.Context(), s.bigQueryClient)
+
+	periodStr := s.getParamOrFail(w, req, "period")
+	if periodStr == "" {
+		return
+	}
+	period, err := time.ParseDuration(periodStr)
+	if err != nil {
+		failureResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid period duration: %s", err.Error()))
+		return
+	}
+	if period <= 0 {
+		failureResponse(w, http.StatusBadRequest, "period must be a positive duration")
+		return
+	}
+
+	var previousPeriod *time.Duration
+	if pp := param.SafeRead(req, "previousPeriod"); pp != "" {
+		d, err := time.ParseDuration(pp)
+		if err != nil {
+			failureResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid previousPeriod duration: %s", err.Error()))
+			return
+		}
+		if d <= 0 {
+			failureResponse(w, http.StatusBadRequest, "previousPeriod must be a positive duration")
+			return
+		}
+		previousPeriod = &d
+	}
+
+	includeOutputs, err := param.ReadBool(req, "includeOutputs", false)
+	if err != nil {
+		failureResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid includeOutputs value: %s", err.Error()))
+		return
+	}
+
+	filterOpts, err := filter.FilterOptionsFromRequest(req, "failure_count", apitype.SortDescending)
+	if err != nil {
+		failureResponse(w, http.StatusBadRequest, "could not parse filter options: "+err.Error())
+		return
+	}
+
+	pagination, err := getPaginationParams(req)
+	if err != nil {
+		failureResponse(w, http.StatusBadRequest, "could not parse pagination options: "+err.Error())
+		return
+	}
+
+	result, err := api.GetRecentTestFailures(s.db, release, period, previousPeriod, includeOutputs, filterOpts, pagination, s.GetReportEnd())
+	if err != nil {
+		failureResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	api.RespondWithJSON(http.StatusOK, w, result)
+}
+
+func (s *Server) jsonTestRunsAndOutputsFromBigQuery(w http.ResponseWriter, req *http.Request) {
+	if s.bigQueryClient == nil {
+		failureResponse(w, http.StatusBadRequest, "test runs API is only available when google-service-account-credential-file is configured")
+		return
+	}
+
+	testID := param.SafeRead(req, "test_id")
+	if testID == "" {
+		failureResponse(w, http.StatusBadRequest, "test_id parameter is required")
+		return
+	}
+
+	// Parse optional comma-separated prow job run IDs
+	var prowJobRunIDList []string
+	if prowJobRunIDs := param.SafeRead(req, "prow_job_run_ids"); prowJobRunIDs != "" {
+		prowJobRunIDList = strings.Split(prowJobRunIDs, ",")
+	}
+
+	// Parse optional multi-valued prowjob_name parameter. Substring matching.
+	prowJobNames := req.URL.Query()["prowjob_name"]
+
+	// Parse include_success parameter (defaults to false)
+	includeSuccess, err := param.ReadBool(req, "include_success", false)
+	if err != nil {
+		failureResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Parse date parameters with defaults
+	var startDate, endDate time.Time
+	startDateParam := getDateParam("start_date", req)
+	endDateParam := getDateParam("end_date", req)
+
+	if endDateParam != nil {
+		// Set to end of day (11:59:59pm)
+		endDate = time.Date(endDateParam.Year(), endDateParam.Month(), endDateParam.Day(), 23, 59, 59, 0, time.UTC)
+	} else {
+		// Default to end of today
+		now := time.Now().UTC()
+		endDate = time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 59, 0, time.UTC)
+	}
+
+	if startDateParam != nil {
+		// Start of the specified day
+		startDate = time.Date(startDateParam.Year(), startDateParam.Month(), startDateParam.Day(), 0, 0, 0, 0, time.UTC)
+	} else {
+		// Default to 7 days before end date at start of day
+		startDate = endDate.AddDate(0, 0, -7)
+		startDate = time.Date(startDate.Year(), startDate.Month(), startDate.Day(), 0, 0, 0, 0, time.UTC)
+	}
+
+	// Validate date range does not exceed 30 days (expensive query)
+	dateRange := endDate.Sub(startDate)
+	maxRange := 30 * 24 * time.Hour
+	if dateRange > maxRange {
+		failureResponse(w, http.StatusBadRequest, fmt.Sprintf("date range exceeds maximum of 30 days (requested: %.0f days)", dateRange.Hours()/24))
+		return
+	}
+
+	outputs, err := api.GetTestRunsAndOutputsFromBigQuery(req.Context(), s.bigQueryClient, testID, prowJobRunIDList, prowJobNames, includeSuccess, startDate, endDate)
+	if err != nil {
+		log.WithError(err).Error("error querying test runs from bigquery")
+		failureResponse(w, http.StatusInternalServerError, "error querying test runs from bigquery")
+		return
+	}
+
+	api.RespondWithJSON(http.StatusOK, w, outputs)
+}
+
+func (s *Server) jsonComponentTestVariantsFromBigQuery(w http.ResponseWriter, req *http.Request) {
+	if s.crDataProvider == nil {
+		failureResponse(w, http.StatusBadRequest, "component report API is only available when a data provider is configured")
+		return
+	}
+	outputs, errs := componentreadiness.GetComponentTestVariants(req.Context(), s.crDataProvider)
 	if len(errs) > 0 {
 		log.Warningf("%d errors were encountered while querying test variants from big query:", len(errs))
 		for _, err := range errs {
@@ -655,11 +939,11 @@ func (s *Server) jsonComponentTestVariantsFromBigQuery(w http.ResponseWriter, re
 }
 
 func (s *Server) jsonJobVariantsFromBigQuery(w http.ResponseWriter, req *http.Request) {
-	if s.bigQueryClient == nil {
-		failureResponse(w, http.StatusBadRequest, "job variants API is only available when google-service-account-credential-file is configured")
+	if s.crDataProvider == nil {
+		failureResponse(w, http.StatusBadRequest, "job variants API is only available when a data provider is configured")
 		return
 	}
-	outputs, errs := componentreadiness.GetJobVariantsFromBigQuery(req.Context(), s.bigQueryClient)
+	outputs, errs := componentreadiness.GetJobVariants(req.Context(), s.crDataProvider)
 	if len(errs) > 0 {
 		log.Warningf("%d errors were encountered while querying job variants from big query:", len(errs))
 		for _, err := range errs {
@@ -672,7 +956,7 @@ func (s *Server) jsonJobVariantsFromBigQuery(w http.ResponseWriter, req *http.Re
 }
 
 func (s *Server) jsonComponentReadinessViews(w http.ResponseWriter, req *http.Request) {
-	allReleases, err := api.GetReleases(req.Context(), s.bigQueryClient, false)
+	allReleases, err := s.getReleases(req.Context())
 	if err != nil {
 		failureResponse(w, http.StatusBadRequest, err.Error())
 		return
@@ -702,41 +986,66 @@ func (s *Server) jsonComponentReadinessViews(w http.ResponseWriter, req *http.Re
 	api.RespondWithJSON(http.StatusOK, w, viewsCopy)
 }
 
+func (s *Server) getRegressedTestsForRegressions(req *http.Request, regressions []models.TestRegression) ([]componentreport.ReportTestSummary, error) {
+	viewName := req.URL.Query().Get("view")
+	if viewName == "" {
+		return nil, fmt.Errorf("view parameter is required")
+	}
+
+	report, err := s.getComponentReportFromRequest(req)
+	if err != nil {
+		return nil, fmt.Errorf("error getting component report for view %s: %v", viewName, err)
+	}
+
+	var result []componentreport.ReportTestSummary
+	for _, regression := range regressions {
+		regressedTest := componentreadiness.GetMatchingRegressedTestForRegression(regression, report)
+		if regressedTest != nil {
+			result = append(result, *regressedTest)
+		}
+	}
+	return result, nil
+}
+
 // getComponentReportFromRequest creates a component report based on the HTTP request parameters
 func (s *Server) getComponentReportFromRequest(req *http.Request) (componentreport.ComponentReport, error) {
-	if s.bigQueryClient == nil {
-		return componentreport.ComponentReport{}, fmt.Errorf("component report API is only available when google-service-account-credential-file is configured")
+	if s.crDataProvider == nil {
+		return componentreport.ComponentReport{}, fmt.Errorf("component report API is only available when a data provider is configured")
 	}
 
-	allJobVariants, errs := componentreadiness.GetJobVariantsFromBigQuery(req.Context(), s.bigQueryClient)
+	allJobVariants, errs := componentreadiness.GetJobVariants(req.Context(), s.crDataProvider)
 	if len(errs) > 0 {
-		return componentreport.ComponentReport{}, fmt.Errorf("failed to get variants from bigquery")
+		return componentreport.ComponentReport{}, fmt.Errorf("failed to get job variants")
 	}
 
-	allReleases, err := api.GetReleases(req.Context(), s.bigQueryClient, false)
+	allReleases, err := s.getReleases(req.Context())
 	if err != nil {
 		return componentreport.ComponentReport{}, err
 	}
 
-	options, err := utils.ParseComponentReportRequest(s.views.ComponentReadiness, allReleases, req, allJobVariants, s.crTimeRoundingFactor,
+	options, warnings, err := utils.ParseComponentReportRequest(s.views.ComponentReadiness, allReleases, req, allJobVariants, s.crTimeRoundingFactor,
 		s.config.ComponentReadinessConfig.VariantJunitTableOverrides)
+
 	if err != nil {
 		return componentreport.ComponentReport{}, err
 	}
 
-	baseURL := api.GetBaseURL(req)
+	// This baseURL is used to generate links to test_details reports, which are frontend links
+	baseURL := api.GetBaseFrontendURL(req)
 
-	outputs, errs := componentreadiness.GetComponentReportFromBigQuery(
+	outputs, errs := componentreadiness.GetComponentReport(
 		req.Context(),
-		s.bigQueryClient,
+		s.crDataProvider,
 		s.db,
 		options,
-		s.config.ComponentReadinessConfig.VariantJunitTableOverrides,
 		baseURL,
 	)
 	if len(errs) > 0 {
 		return componentreport.ComponentReport{}, fmt.Errorf("error querying component from big query: %v", errs)
 	}
+
+	// Add any warnings from parsing to the report
+	outputs.Warnings = warnings
 
 	return outputs, nil
 }
@@ -752,31 +1061,32 @@ func (s *Server) jsonComponentReportFromBigQuery(w http.ResponseWriter, req *htt
 }
 
 func (s *Server) jsonComponentReportTestDetailsFromBigQuery(w http.ResponseWriter, req *http.Request) {
-	if s.bigQueryClient == nil {
-		err := fmt.Errorf("component report API is only available when google-service-account-credential-file is configured")
+	if s.crDataProvider == nil {
+		err := fmt.Errorf("component report API is only available when a data provider is configured")
 		failureResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	allJobVariants, errs := componentreadiness.GetJobVariantsFromBigQuery(req.Context(), s.bigQueryClient)
+	allJobVariants, errs := componentreadiness.GetJobVariants(req.Context(), s.crDataProvider)
 	if len(errs) > 0 {
-		err := fmt.Errorf("failed to get variants from bigquery")
+		err := fmt.Errorf("failed to get job variants")
 		failureResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	allReleases, err := api.GetReleases(req.Context(), s.bigQueryClient, false)
+	allReleases, err := s.getReleases(req.Context())
 	if err != nil {
 		failureResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	reqOptions, err := utils.ParseComponentReportRequest(s.views.ComponentReadiness, allReleases, req, allJobVariants, s.crTimeRoundingFactor,
+	reqOptions, _, err := utils.ParseComponentReportRequest(s.views.ComponentReadiness, allReleases, req, allJobVariants, s.crTimeRoundingFactor,
 		s.config.ComponentReadinessConfig.VariantJunitTableOverrides)
+
 	if err != nil {
 		failureResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	baseURL := api.GetBaseURL(req)
-	outputs, errs := componentreadiness.GetTestDetails(req.Context(), s.bigQueryClient, s.db, reqOptions, allReleases, baseURL)
+	outputs, errs := componentreadiness.GetTestDetails(req.Context(), s.crDataProvider, s.db, reqOptions, allReleases, baseURL)
 	if len(errs) > 0 {
 		log.Warningf("%d errors were encountered while querying component test details from big query:", len(errs))
 		for _, err := range errs {
@@ -825,7 +1135,7 @@ func (s *Server) jsonJobBugsFromDB(w http.ResponseWriter, req *http.Request) {
 func (s *Server) jsonTestsReportFromDB(w http.ResponseWriter, req *http.Request) {
 	release := s.getParamOrFail(w, req, "release")
 	if release != "" {
-		api.PrintTestsJSONFromDB(release, w, req, s.db)
+		api.PrintTestsJSONFromDB(w, req, s.db, s.cache, release)
 	}
 }
 
@@ -851,8 +1161,8 @@ func (s *Server) jsonTestDetailsReportFromDB(w http.ResponseWriter, req *http.Re
 }
 
 func (s *Server) jsonReleasesReportFromDB(w http.ResponseWriter, req *http.Request) {
-	forceRefresh := req.URL.Query().Get("forceRefresh") != "" // use to refresh cached releases from BQ
-	releases, err := api.GetReleases(req.Context(), s.bigQueryClient, forceRefresh)
+	forceRefresh := req.URL.Query().Get("forceRefresh") != ""
+	releases, err := s.getReleases(req.Context(), forceRefresh)
 	if err != nil {
 		log.WithError(err).Error("error querying releases")
 		failureResponse(w, http.StatusInternalServerError, "error querying releases")
@@ -882,7 +1192,7 @@ func (s *Server) jsonReleasesReportFromDB(w http.ResponseWriter, req *http.Reque
 }
 
 func (s *Server) jsonTestCapabilitiesFromDB(w http.ResponseWriter, req *http.Request) {
-	capabilities, err := api.GetTestCapabilitiesFromDB(s.bigQueryClient)
+	capabilities, err := api.GetTestCapabilitiesFromDB(req.Context(), s.bigQueryClient)
 	if err != nil {
 		log.WithError(err).Error("error querying test capabilities")
 		failureResponse(w, http.StatusInternalServerError, "error querying test capabilities")
@@ -890,6 +1200,17 @@ func (s *Server) jsonTestCapabilitiesFromDB(w http.ResponseWriter, req *http.Req
 	}
 
 	api.RespondWithJSON(http.StatusOK, w, capabilities)
+}
+
+func (s *Server) jsonTestLifecyclesFromDB(w http.ResponseWriter, req *http.Request) {
+	lifecycles, err := api.GetTestLifecyclesFromDB(req.Context(), s.bigQueryClient)
+	if err != nil {
+		log.WithError(err).Error("error querying test lifecycles")
+		failureResponse(w, http.StatusInternalServerError, "error querying test lifecycles")
+		return
+	}
+
+	api.RespondWithJSON(http.StatusOK, w, lifecycles)
 }
 
 func (s *Server) jsonHealthReportFromDB(w http.ResponseWriter, req *http.Request) {
@@ -954,13 +1275,6 @@ func (s *Server) printReportDate(w http.ResponseWriter, req *http.Request) {
 	api.RespondWithJSON(http.StatusOK, w, map[string]interface{}{"pinnedDateTime": reportDate})
 }
 
-func (s *Server) printCanaryReportFromDB(w http.ResponseWriter, req *http.Request) {
-	release := s.getParamOrFail(w, req, "release")
-	if release != "" {
-		api.PrintCanaryTestsFromDB(release, w, s.db)
-	}
-}
-
 func (s *Server) jsonVariantsReportFromDB(w http.ResponseWriter, req *http.Request) {
 	release := s.getParamOrFail(w, req, "release")
 	if release != "" {
@@ -1015,6 +1329,14 @@ func (s *Server) jsonPullRequestsReportFromDB(w http.ResponseWriter, req *http.R
 	}
 }
 
+func (s *Server) jsonPullRequestTestResults(w http.ResponseWriter, req *http.Request) {
+	if s.bigQueryClient == nil {
+		failureResponse(w, http.StatusBadRequest, "pull request test results API is only available when google-service-account-credential-file is configured")
+		return
+	}
+	api.PrintPRTestResultsJSON(w, req, s.bigQueryClient)
+}
+
 func (s *Server) jsonJobRunSummary(w http.ResponseWriter, req *http.Request) {
 	jobRunIDStr := s.getParamOrFail(w, req, "prow_job_run_id")
 	if jobRunIDStr == "" {
@@ -1029,6 +1351,10 @@ func (s *Server) jsonJobRunSummary(w http.ResponseWriter, req *http.Request) {
 
 	summary, err := api.GetJobRunSummary(req.Context(), s.db, s.gcsClient, jobRunID)
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			api.RespondWithJSON(http.StatusNotFound, w, "job run not found")
+			return
+		}
 		api.RespondWithJSON(http.StatusInternalServerError, w, err.Error())
 		return
 	}
@@ -1168,7 +1494,7 @@ func (s *Server) jsonJobRunRiskAnalysis(w http.ResponseWriter, req *http.Request
 	}
 
 	logger.Infof("job run = %+v", *jobRun)
-	result, err := api.JobRunRiskAnalysis(s.db, s.bigQueryClient, jobRun, logger, false)
+	result, err := api.JobRunRiskAnalysis(req.Context(), logger, s.db, s.bigQueryClient, s.cache, jobRun, false)
 	if err != nil {
 		failureResponse(w, http.StatusBadRequest, err.Error())
 		return
@@ -1228,6 +1554,55 @@ func (s *Server) jsonJobRunIntervals(w http.ResponseWriter, req *http.Request) {
 	}
 	result, err := jobrunintervals.JobRunIntervals(s.gcsClient, s.db, jobRunID, s.gcsBucket, gcsPath,
 		intervalFile, logger.WithField("func", "JobRunIntervals"))
+	if err != nil {
+		failureResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	api.RespondWithJSON(http.StatusOK, w, result)
+}
+
+// jsonJobRunEvents fetches Kubernetes events from events.json in the job run's GCS artifacts.
+// The file is located at artifacts/*e2e*/gather-extra/artifacts/events.json
+func (s *Server) jsonJobRunEvents(w http.ResponseWriter, req *http.Request) {
+	logger := log.WithField("func", "jsonJobRunEvents")
+
+	if s.gcsClient == nil {
+		failureResponse(w, http.StatusBadRequest, "server not configured for GCS, unable to use this API")
+		return
+	}
+
+	jobRunIDStr := s.getParamOrFail(w, req, "prow_job_run_id")
+	if jobRunIDStr == "" {
+		return
+	}
+
+	jobRunID, err := strconv.ParseInt(jobRunIDStr, 10, 64)
+	if err != nil {
+		failureResponse(w, http.StatusBadRequest, "unable to parse prow_job_run_id: "+err.Error())
+		return
+	}
+	logger = logger.WithField("jobRunID", jobRunID)
+
+	jobName := param.SafeRead(req, "job_name")
+	repoInfo := param.SafeRead(req, "repo_info")
+	pullNumber := param.SafeRead(req, "pull_number")
+
+	var gcsPath string
+	if len(jobName) > 0 {
+		if len(repoInfo) > 0 {
+			if repoInfo == "openshift_origin" {
+				gcsPath = fmt.Sprintf("pr-logs/pull/%s/%s/%s", pullNumber, jobName, jobRunIDStr)
+			} else {
+				gcsPath = fmt.Sprintf("pr-logs/pull/%s/%s/%s/%s", repoInfo, pullNumber, jobName, jobRunIDStr)
+			}
+		} else {
+			gcsPath = fmt.Sprintf("logs/%s/%s", jobName, jobRunIDStr)
+		}
+	}
+
+	result, err := jobrunevents.JobRunEvents(s.gcsClient, s.db, jobRunID, s.gcsBucket, gcsPath,
+		logger.WithField("func", "JobRunEvents"))
 	if err != nil {
 		failureResponse(w, http.StatusBadRequest, err.Error())
 		return
@@ -1297,20 +1672,21 @@ func (s *Server) jsonGetTriages(w http.ResponseWriter, req *http.Request) {
 }
 
 // ExpandedTriage allows for additional information to be included in the triage response.
-// Currently, this is only the associated ReportTestSummaries which are useful for linking to the test_details report.
 type ExpandedTriage struct {
 	*models.Triage
-	RegressedTests []*componentreport.ReportTestSummary `json:"regressed_tests"`
+	RegressedTests   map[string][]*componentreport.ReportTestSummary `json:"regressed_tests"`
+	SymptomSummaries []componentreadiness.TriageSymptomSummary       `json:"symptom_summaries,omitempty"`
 }
 
 func (s *Server) jsonGetTriageByID(w http.ResponseWriter, req *http.Request) {
 	vars := mux.Vars(req)
 	idStr := vars["id"]
 
-	var expandRegressions bool
-	expand := req.URL.Query().Get("expand")
-	if expand == "regressions" {
-		expandRegressions = true
+	expandFields := make(map[string]bool)
+	for _, field := range strings.Split(req.URL.Query().Get("expand"), ",") {
+		if f := strings.TrimSpace(field); f != "" {
+			expandFields[f] = true
+		}
 	}
 
 	triageID, err := strconv.Atoi(idStr)
@@ -1328,7 +1704,8 @@ func (s *Server) jsonGetTriageByID(w http.ResponseWriter, req *http.Request) {
 		failureResponse(w, http.StatusNotFound, "triage not found")
 		return
 	}
-	if !expandRegressions {
+
+	if len(expandFields) == 0 {
 		api.RespondWithJSON(http.StatusOK, w, triage)
 		return
 	}
@@ -1337,25 +1714,36 @@ func (s *Server) jsonGetTriageByID(w http.ResponseWriter, req *http.Request) {
 		Triage: triage,
 	}
 
-	associatedViews := sets.NewString()
-	for _, regression := range triage.Regressions {
-		associatedViews.Insert(regression.View)
-	}
-
-	for _, view := range associatedViews.List() {
-		// Set the view in the request so that we can obtain the component report to get the regressed test(s) for display
-		q := req.URL.Query()
-		q.Set("view", view)
-		req.URL.RawQuery = q.Encode()
-		componentReport, err := s.getComponentReportFromRequest(req)
+	if expandFields["symptoms"] {
+		symptomSummaries, err := componentreadiness.GetTriageSymptomSummaries(s.db, triage.ID, len(triage.Regressions))
 		if err != nil {
-			failureResponse(w, http.StatusInternalServerError, fmt.Sprintf("unable to get component report: %v", err))
+			failureResponse(w, http.StatusInternalServerError, fmt.Sprintf("error getting symptom summaries for triage %d: %v", triage.ID, err))
 			return
 		}
-		for _, regression := range triage.Regressions {
-			regressedTest := componentreadiness.GetMatchingRegressedTestForRegression(regression, componentReport)
-			if regressedTest != nil {
-				et.RegressedTests = append(et.RegressedTests, regressedTest)
+		et.SymptomSummaries = symptomSummaries
+	}
+
+	if expandFields["regressions"] {
+		et.RegressedTests = make(map[string][]*componentreport.ReportTestSummary)
+		views := componentreadiness.GetViewsForTriage(triage)
+		for _, view := range views {
+			q := req.URL.Query()
+			q.Set("view", view)
+			req.URL.RawQuery = q.Encode()
+			componentReport, err := s.getComponentReportFromRequest(req)
+			if err != nil {
+				failureResponse(w, http.StatusInternalServerError, fmt.Sprintf("unable to get component report: %v", err))
+				return
+			}
+			var regressedTests []*componentreport.ReportTestSummary
+			for _, regression := range triage.Regressions {
+				regressedTest := componentreadiness.GetMatchingRegressedTestForRegression(regression, componentReport)
+				if regressedTest != nil {
+					regressedTests = append(regressedTests, regressedTest)
+				}
+			}
+			if len(regressedTests) > 0 {
+				et.RegressedTests[view] = regressedTests
 			}
 		}
 	}
@@ -1445,36 +1833,40 @@ func (s *Server) jsonTriagePotentialMatchingRegressions(w http.ResponseWriter, r
 
 	triage, err := componentreadiness.GetTriage(s.db, triageID, req)
 	if err != nil {
-		failureResponse(w, http.StatusInternalServerError, err.Error())
+		failureResponse(w, http.StatusInternalServerError, fmt.Sprintf("error getting triages: %v", err))
 		return
 	}
 	if triage == nil {
 		failureResponse(w, http.StatusNotFound, "triage not found")
 		return
 	}
-	view := req.URL.Query().Get("view")
-	if view == "" {
+	viewName := req.URL.Query().Get("view")
+	if viewName == "" {
 		failureResponse(w, http.StatusBadRequest, "no view provided")
 		return
 	}
-	// TODO(sgoeddel): I don't think we need the component report anymore, the regressions should contain the test_details link, but do they contain the status?
-	componentReport, err := s.getComponentReportFromRequest(req)
+	view, ok := componentreadiness.FindViewByName(viewName, s.views.ComponentReadiness)
+	if !ok {
+		failureResponse(w, http.StatusBadRequest, fmt.Sprintf("view not found: %s", viewName))
+		return
+	}
+	allReleases, err := s.getReleases(req.Context())
 	if err != nil {
 		failureResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	allReleases, err := api.GetReleases(req.Context(), s.bigQueryClient, false)
+	regressions, err := componentreadiness.ListRegressions(s.db, view.SampleRelease.Name, s.views.ComponentReadiness, allReleases, s.crTimeRoundingFactor, req)
 	if err != nil {
-		failureResponse(w, http.StatusInternalServerError, fmt.Sprintf("error getting releases: %v", err))
+		failureResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	regressions, err := componentreadiness.ListRegressions(s.db, view, "", s.views.ComponentReadiness, allReleases, s.crTimeRoundingFactor, req)
+	regressedTests, err := s.getRegressedTestsForRegressions(req, regressions)
 	if err != nil {
 		failureResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	potentialMatches, err := componentreadiness.GetTriagePotentialMatches(triage, regressions, componentReport, req)
+	potentialMatches, err := componentreadiness.GetTriagePotentialMatches(triage, regressions, regressedTests, req)
 	if err != nil {
 		failureResponse(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1504,7 +1896,7 @@ func (s *Server) jsonGetTriageAuditDetails(w http.ResponseWriter, req *http.Requ
 // jsonGetRegressions handles GET requests for listing component readiness regression records.
 func (s *Server) jsonGetRegressions(w http.ResponseWriter, req *http.Request) {
 	// Get releases for view processing
-	allReleases, err := api.GetReleases(req.Context(), s.bigQueryClient, false)
+	allReleases, err := s.getReleases(req.Context())
 	if err != nil {
 		failureResponse(w, http.StatusInternalServerError, fmt.Sprintf("error getting releases: %v", err))
 		return
@@ -1519,8 +1911,24 @@ func (s *Server) jsonGetRegressions(w http.ResponseWriter, req *http.Request) {
 		failureResponse(w, http.StatusBadRequest, "Cannot specify both 'view' and 'release' parameters. Please use only one.")
 		return
 	}
+	views := s.views.ComponentReadiness
+	if view != "" {
+		foundView := false
+		for _, v := range s.views.ComponentReadiness {
+			if v.Name == view {
+				views = []crview.View{v}
+				release = v.SampleRelease.Name
+				foundView = true
+				break
+			}
+		}
+		if !foundView {
+			failureResponse(w, http.StatusBadRequest, fmt.Sprintf("View '%s' not found in views", view))
+			return
+		}
+	}
 
-	regressions, err := componentreadiness.ListRegressions(s.db, view, release, s.views.ComponentReadiness, allReleases, s.crTimeRoundingFactor, req)
+	regressions, err := componentreadiness.ListRegressions(s.db, release, views, allReleases, s.crTimeRoundingFactor, req)
 	if err != nil {
 		failureResponse(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1540,7 +1948,7 @@ func (s *Server) jsonGetRegressionByID(w http.ResponseWriter, req *http.Request)
 	}
 
 	// Get releases for view processing
-	allReleases, err := api.GetReleases(req.Context(), s.bigQueryClient, false)
+	allReleases, err := s.getReleases(req.Context())
 	if err != nil {
 		failureResponse(w, http.StatusInternalServerError, fmt.Sprintf("error getting releases: %v", err))
 		return
@@ -1578,7 +1986,7 @@ func (s *Server) jsonRegressionPotentialMatchingTriages(w http.ResponseWriter, r
 		return
 	}
 	// Get releases for view processing
-	allReleases, err := api.GetReleases(req.Context(), s.bigQueryClient, false)
+	allReleases, err := s.getReleases(req.Context())
 	if err != nil {
 		failureResponse(w, http.StatusInternalServerError, fmt.Sprintf("error getting releases: %v", err))
 		return
@@ -1599,24 +2007,6 @@ func (s *Server) jsonRegressionPotentialMatchingTriages(w http.ResponseWriter, r
 	api.RespondWithJSON(http.StatusOK, w, matches)
 }
 
-// FileBugRequest represents the JSON request structure for filing Jira bugs
-type FileBugRequest struct {
-	Summary         string   `json:"summary"`
-	Description     string   `json:"description"`
-	AffectsVersions []string `json:"affects_versions"`
-	Components      []string `json:"components"`
-	ComponentID     string   `json:"component_id"`
-	Labels          []string `json:"labels"`
-}
-
-// FileBugResponse represents the JSON response structure for filing Jira bugs
-type FileBugResponse struct {
-	Success bool   `json:"success"`
-	DryRun  bool   `json:"dry_run"`
-	JiraKey string `json:"jira_key"`
-	JiraURL string `json:"jira_url"`
-}
-
 // jsonFileJiraBug allows for a Jira "OCPBUGS" card to be created for the given FileBugRequest
 // If successful, the response is a jsonified FileBugResponse
 func (s *Server) jsonFileJiraBug(w http.ResponseWriter, req *http.Request) {
@@ -1633,7 +2023,7 @@ func (s *Server) jsonFileJiraBug(w http.ResponseWriter, req *http.Request) {
 		}
 		log.Infof("jira bug creation requested by user: %s", user)
 
-		var bugRequest FileBugRequest
+		var bugRequest util.FileBugRequest
 		if err := json.NewDecoder(req.Body).Decode(&bugRequest); err != nil {
 			log.WithError(err).Error("error parsing jira bug request")
 			failureResponse(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %s", err.Error()))
@@ -1659,39 +2049,10 @@ func (s *Server) jsonFileJiraBug(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 
-		// Due to the way the OCPBUGS project is configured, we cannot set the "Reporter", so we add it to the description for some tracking
-		description := fmt.Sprintf("%s\n\nFiled by: [~%s@redhat.com]", bugRequest.Description, user)
-
-		issue := jira.Issue{
-			Fields: &jira.IssueFields{
-				Description: description,
-				Type: jira.IssueType{
-					Name: "Bug",
-				},
-				Project: jira.Project{
-					Key: "OCPBUGS",
-				},
-				Summary: bugRequest.Summary,
-			},
-		}
-
-		affectsVersions := make([]*jira.AffectsVersion, len(bugRequest.AffectsVersions))
-		for i, version := range bugRequest.AffectsVersions {
-			affectsVersions[i] = &jira.AffectsVersion{
-				Name: version,
-			}
-		}
-		issue.Fields.AffectsVersions = affectsVersions
-
-		components := make([]*jira.Component, 0)
-		for _, comp := range bugRequest.Components {
-			components = append(components, &jira.Component{Name: comp})
-		}
-		components = append(components, &jira.Component{ID: bugRequest.ComponentID})
-		issue.Fields.Components = components
-
-		if len(bugRequest.Labels) > 0 {
-			issue.Fields.Labels = bugRequest.Labels
+		issue, err := util.PopulateJiraIssue(s.jiraClient, bugRequest, user)
+		if err != nil && s.jiraClient != nil {
+			failureResponse(w, http.StatusInternalServerError, err.Error())
+			return
 		}
 
 		var createdIssue *jira.Issue
@@ -1712,10 +2073,10 @@ func (s *Server) jsonFileJiraBug(w http.ResponseWriter, req *http.Request) {
 			dryRun = true
 		}
 
-		log.Infof("created jira issue %s for user %s", createdIssue.Key, user)
+		log.Infof("created jira issue %s for user %s (dryrun:%v)", createdIssue.Key, user, dryRun)
 
-		jiraURL := fmt.Sprintf("https://issues.redhat.com/browse/%s", createdIssue.Key)
-		response := FileBugResponse{
+		jiraURL := fmt.Sprintf("https://redhat.atlassian.net/browse/%s", createdIssue.Key)
+		response := util.FileBugResponse{
 			Success: true,
 			DryRun:  dryRun,
 			JiraKey: createdIssue.Key,
@@ -1857,6 +2218,31 @@ func (s *Server) requireCapabilities(capabilities []string, implFn func(w http.R
 	}
 }
 
+func (s *Server) rateLimit(endpointPath string, maxRequests int, period time.Duration, handler func(w http.ResponseWriter, r *http.Request)) func(http.ResponseWriter, *http.Request) {
+	// Initialize rate limiter map if needed
+	if s.rateLimiters == nil {
+		s.rateLimiters = make(map[string]*rateLimiter)
+	}
+
+	// Create or get rate limiter for this endpoint
+	if s.rateLimiters[endpointPath] == nil {
+		s.rateLimiters[endpointPath] = &rateLimiter{
+			maxRequests: maxRequests,
+			period:      period,
+		}
+	}
+
+	rl := s.rateLimiters[endpointPath]
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !rl.allow() {
+			failureResponse(w, http.StatusTooManyRequests, fmt.Sprintf("Rate limit exceeded. Maximum %d requests per %s. Please try again later.", maxRequests, period))
+			return
+		}
+		handler(w, r)
+	}
+}
+
 func (s *Server) Serve() {
 	s.determineCapabilities()
 
@@ -1873,7 +2259,7 @@ func (s *Server) Serve() {
 				if !os.IsNotExist(err) {
 					w.WriteHeader(http.StatusNotFound)
 					w.Header().Set("Content-Type", "text/plain")
-					if _, err := w.Write([]byte(fmt.Sprintf("404 Not Found: %s", fullPath))); err != nil {
+					if _, err := fmt.Fprintf(w, "404 Not Found: %s", fullPath); err != nil { //nolint:gosec // G705: Content-Type is text/plain (set on line above), browsers will not execute script in plain text
 						log.WithError(err).Warningf("could not write response")
 					}
 					return
@@ -1886,25 +2272,18 @@ func (s *Server) Serve() {
 
 	router.PathPrefix("/static/").Handler(http.FileServer(http.FS(s.static)))
 
-	// Re-direct "/" to sippy-ng
-	router.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
-		if req.URL.Path != "/" {
-			http.NotFound(w, req)
-			return
-		}
-		http.Redirect(w, req, "/sippy-ng/", http.StatusMovedPermanently)
-	}).Methods(http.MethodGet)
-
 	// Setup MCP Server
 	mcpServer := mcp.NewMCPServer(context.Background(), s.httpServer, s.db, s.bigQueryClient, s.cache)
 
 	type apiEndpoints struct {
-		EndpointPath string                                       `json:"path"`
-		Description  string                                       `json:"description"`
-		Capabilities []string                                     `json:"required_capabilities"`
-		CacheTime    time.Duration                                `json:"cache_time"`
-		Methods      []string                                     `json:"methods,omitempty"`
-		HandlerFunc  func(w http.ResponseWriter, r *http.Request) `json:"-"`
+		EndpointPath      string                                       `json:"path"`
+		Description       string                                       `json:"description"`
+		Capabilities      []string                                     `json:"required_capabilities"`
+		CacheTime         time.Duration                                `json:"cache_time"`
+		Methods           []string                                     `json:"methods,omitempty"`
+		HandlerFunc       func(w http.ResponseWriter, r *http.Request) `json:"-"`
+		RateLimitRequests int                                          `json:"-"` // Maximum number of requests
+		RateLimitPeriod   time.Duration                                `json:"-"` // Time period for rate limit
 	}
 
 	var endpoints []apiEndpoints
@@ -1974,6 +2353,13 @@ func (s *Server) Serve() {
 			HandlerFunc:  s.jsonJobRunIntervals,
 		},
 		{
+			EndpointPath: "/api/jobs/runs/events",
+			Description:  "Returns Kubernetes events from job run artifacts (events.json)",
+			Capabilities: []string{LocalDBCapability},
+			CacheTime:    4 * time.Hour,
+			HandlerFunc:  s.jsonJobRunEvents,
+		},
+		{
 			EndpointPath: "/api/jobs/analysis",
 			Description:  "Analyzes jobs from the database",
 			Capabilities: []string{LocalDBCapability},
@@ -1998,6 +2384,76 @@ func (s *Server) Serve() {
 			HandlerFunc:  s.queryJobArtifacts,
 		},
 		{
+			EndpointPath: "/api/jobs/labels",
+			Description:  "List all job run label definitions",
+			Methods:      []string{http.MethodGet},
+			Capabilities: []string{LocalDBCapability},
+			HandlerFunc:  s.jsonListLabels,
+		},
+		{
+			EndpointPath: "/api/jobs/labels",
+			Description:  "Create a new job run label definition",
+			Methods:      []string{http.MethodPost},
+			Capabilities: []string{LocalDBCapability, WriteEndpointsCapability},
+			HandlerFunc:  s.jsonCreateLabel,
+		},
+		{
+			EndpointPath: "/api/jobs/labels/{id}",
+			Description:  "Get a specific job run label definition",
+			Methods:      []string{http.MethodGet},
+			Capabilities: []string{LocalDBCapability},
+			HandlerFunc:  s.jsonGetLabel,
+		},
+		{
+			EndpointPath: "/api/jobs/labels/{id}",
+			Description:  "Update a job run label definition",
+			Methods:      []string{http.MethodPut},
+			Capabilities: []string{LocalDBCapability, WriteEndpointsCapability},
+			HandlerFunc:  s.jsonUpdateLabel,
+		},
+		{
+			EndpointPath: "/api/jobs/labels/{id}",
+			Description:  "Delete a job run label definition",
+			Methods:      []string{http.MethodDelete},
+			Capabilities: []string{LocalDBCapability, WriteEndpointsCapability},
+			HandlerFunc:  s.jsonDeleteLabel,
+		},
+		{
+			EndpointPath: "/api/jobs/symptoms",
+			Description:  "List all job run symptom definitions",
+			Methods:      []string{http.MethodGet},
+			Capabilities: []string{LocalDBCapability},
+			HandlerFunc:  s.jsonListSymptoms,
+		},
+		{
+			EndpointPath: "/api/jobs/symptoms",
+			Description:  "Create a new job run symptom definition",
+			Methods:      []string{http.MethodPost},
+			Capabilities: []string{LocalDBCapability, WriteEndpointsCapability},
+			HandlerFunc:  s.jsonCreateSymptom,
+		},
+		{
+			EndpointPath: "/api/jobs/symptoms/{id}",
+			Description:  "Get a specific job run symptom definition",
+			Methods:      []string{http.MethodGet},
+			Capabilities: []string{LocalDBCapability},
+			HandlerFunc:  s.jsonGetSymptom,
+		},
+		{
+			EndpointPath: "/api/jobs/symptoms/{id}",
+			Description:  "Update a job run symptom definition",
+			Methods:      []string{http.MethodPut},
+			Capabilities: []string{LocalDBCapability, WriteEndpointsCapability},
+			HandlerFunc:  s.jsonUpdateSymptom,
+		},
+		{
+			EndpointPath: "/api/jobs/symptoms/{id}",
+			Description:  "Delete a job run symptom definition",
+			Methods:      []string{http.MethodDelete},
+			Capabilities: []string{LocalDBCapability, WriteEndpointsCapability},
+			HandlerFunc:  s.jsonDeleteSymptom,
+		},
+		{
 			EndpointPath: "/api/job_variants",
 			Description:  "Reports all job variants defined in BigQuery",
 			Capabilities: []string{ComponentReadinessCapability},
@@ -2011,6 +2467,15 @@ func (s *Server) Serve() {
 			HandlerFunc:  s.jsonPullRequestsReportFromDB,
 		},
 		{
+			EndpointPath:      "/api/pull_requests/test_results",
+			Description:       "Fetches test failures for a specific pull request from BigQuery (presubmits and /payload jobs). Optional: include_successes param to also return successes for matching test names",
+			Capabilities:      []string{ComponentReadinessCapability},
+			HandlerFunc:       s.jsonPullRequestTestResults,
+			CacheTime:         1 * time.Hour,
+			RateLimitRequests: 20,
+			RateLimitPeriod:   1 * time.Hour,
+		},
+		{
 			EndpointPath: "/api/repositories",
 			Description:  "Reports on repositories",
 			Capabilities: []string{LocalDBCapability},
@@ -2020,14 +2485,12 @@ func (s *Server) Serve() {
 			EndpointPath: "/api/tests",
 			Description:  "Reports on tests",
 			Capabilities: []string{LocalDBCapability},
-			CacheTime:    1 * time.Hour,
 			HandlerFunc:  s.jsonTestsReportFromDB,
 		},
 		{
 			EndpointPath: "/api/tests/v2",
 			Description:  "Reports on tests",
 			Capabilities: []string{LocalDBCapability},
-			CacheTime:    1 * time.Hour,
 			HandlerFunc:  s.jsonTestsReportFromBigQuery,
 		},
 		{
@@ -2073,6 +2536,22 @@ func (s *Server) Serve() {
 			HandlerFunc:  s.jsonTestOutputsFromDB,
 		},
 		{
+			EndpointPath: "/api/tests/recent_failures",
+			Description:  "Lists tests that recently started failing with configurable time windows",
+			Capabilities: []string{LocalDBCapability},
+			CacheTime:    1 * time.Hour,
+			HandlerFunc:  s.jsonGetRecentTestFailures,
+		},
+		{
+			EndpointPath:      "/api/tests/v2/runs",
+			Description:       "Test runs from BigQuery with optional filtering by prow job run IDs and job names",
+			Capabilities:      []string{ComponentReadinessCapability},
+			CacheTime:         1 * time.Hour,
+			HandlerFunc:       s.jsonTestRunsAndOutputsFromBigQuery,
+			RateLimitRequests: 25,
+			RateLimitPeriod:   1 * time.Hour,
+		},
+		{
 			EndpointPath: "/api/tests/durations",
 			Description:  "Durations of tests",
 			Capabilities: []string{LocalDBCapability},
@@ -2085,6 +2564,13 @@ func (s *Server) Serve() {
 			Capabilities: []string{ComponentReadinessCapability},
 			CacheTime:    1 * time.Hour,
 			HandlerFunc:  s.jsonTestCapabilitiesFromDB,
+		},
+		{
+			EndpointPath: "/api/tests/lifecycles",
+			Description:  "Returns list of available test lifecycles",
+			Capabilities: []string{ComponentReadinessCapability},
+			CacheTime:    1 * time.Hour,
+			HandlerFunc:  s.jsonTestLifecyclesFromDB,
 		},
 		{
 			EndpointPath: "/api/install",
@@ -2130,12 +2616,6 @@ func (s *Server) Serve() {
 			Description:  "Reports on variants",
 			Capabilities: []string{LocalDBCapability},
 			HandlerFunc:  s.jsonVariantsReportFromDB,
-		},
-		{
-			EndpointPath: "/api/canary",
-			Description:  "Displays canary report from database",
-			Capabilities: []string{LocalDBCapability},
-			HandlerFunc:  s.printCanaryReportFromDB,
 		},
 		{
 			EndpointPath: "/api/report_date",
@@ -2305,6 +2785,7 @@ func (s *Server) Serve() {
 			EndpointPath: "/api/feature_gates",
 			Description:  "Reports feature gates and their test counts for a particular release",
 			Capabilities: []string{LocalDBCapability},
+			CacheTime:    4 * time.Hour,
 			HandlerFunc:  s.jsonFeatureGates,
 		},
 		{
@@ -2322,6 +2803,12 @@ func (s *Server) Serve() {
 		{
 			EndpointPath: "/api/chat/personas",
 			Description:  "Proxy for listing personas from sippy-chat service.",
+			Capabilities: []string{ChatCapability},
+			HandlerFunc:  s.handleChatProxy,
+		},
+		{
+			EndpointPath: "/api/chat/models",
+			Description:  "Proxy for listing available models from sippy-chat service.",
 			Capabilities: []string{ChatCapability},
 			HandlerFunc:  s.handleChatProxy,
 		},
@@ -2363,9 +2850,17 @@ func (s *Server) Serve() {
 
 	for _, ep := range endpoints {
 		fn := ep.HandlerFunc
+		// Apply rate limiting first (innermost middleware)
+		// This ensures cached responses bypass rate limiting
+		if ep.RateLimitRequests > 0 && ep.RateLimitPeriod > 0 {
+			fn = s.rateLimit(ep.EndpointPath, ep.RateLimitRequests, ep.RateLimitPeriod, fn)
+		}
+		// Apply caching second - wraps rate-limited handler
+		// Cache hits return early without calling the rate-limited handler
 		if ep.CacheTime > 0 {
 			fn = s.cached(ep.CacheTime, fn)
 		}
+		// Apply capability checks last (outermost middleware)
 		if len(ep.Capabilities) > 0 {
 			fn = s.requireCapabilities(ep.Capabilities, fn)
 		}
@@ -2376,6 +2871,24 @@ func (s *Server) Serve() {
 			route.Methods(ep.Methods...)
 		}
 	}
+
+	// Catch-all fallback: serve static files for any unmatched routes, or redirect to sippy-ng
+	router.PathPrefix("/").HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Try to open the file from static filesystem (embedded FS keeps directory structure)
+		filePath := "static" + r.URL.Path
+		if _, err := s.static.Open(filePath); err != nil {
+			// File doesn't exist in static, redirect to sippy-ng
+			if r.URL.Path == "/" {
+				http.Redirect(w, r, "/sippy-ng/", http.StatusMovedPermanently)
+			} else {
+				http.NotFound(w, r)
+			}
+			return
+		}
+		// File exists, rewrite path to include /static prefix and serve
+		r.URL.Path = "/static" + r.URL.Path
+		http.FileServer(http.FS(s.static)).ServeHTTP(w, r)
+	})
 
 	var handler http.Handler = router
 	handler = logRequestHandler(handler)
@@ -2401,20 +2914,62 @@ func (s *Server) Serve() {
 
 	log.Infof("Serving reports on %s ", s.listenAddr)
 
+	// Handle graceful shutdown on SIGINT/SIGTERM so coverage data is flushed
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		log.Infof("Received %s, shutting down server...", sig)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.httpServer.Shutdown(ctx); err != nil {
+			log.WithError(err).Error("Error during server shutdown")
+		}
+	}()
+
 	if err := s.httpServer.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		log.WithError(err).Error("Server exited")
 	}
 }
 
+type statusCapturingResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusCapturingResponseWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// Hijack delegates to the underlying ResponseWriter so gorilla/websocket can upgrade connections (e.g. /api/chat/stream).
+func (w *statusCapturingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, fmt.Errorf("upstream ResponseWriter does not implement http.Hijacker")
+}
+
 func logRequestHandler(h http.Handler) http.Handler {
 	fn := func(w http.ResponseWriter, r *http.Request) {
+		// add request context for any BQ queries that may be made
+		bqCtx := bqlabel.RequestContext{
+			User:    getUserForRequest(r),
+			IP:      getRequestorIP(r),
+			URIPath: r.URL.Path,
+		}
+		r = r.Clone(context.WithValue(r.Context(), sippybq.RequestContextKey, bqCtx))
+
+		sw := &statusCapturingResponseWriter{ResponseWriter: w, status: http.StatusOK}
 		start := time.Now()
-		h.ServeHTTP(w, r)
+		h.ServeHTTP(sw, r)
 		log.WithFields(log.Fields{
-			"uri":       r.URL.String(),
-			"method":    r.Method,
-			"elapsed":   time.Since(start),
-			"requestor": getRequestorIP(r),
+			"uri":        r.URL.String(),
+			"method":     r.Method,
+			"status":     sw.status,
+			"elapsed":    time.Since(start),
+			"requestor":  bqCtx.IP,
+			"user_agent": r.UserAgent(),
 		}).Info("responded to request")
 	}
 	return http.HandlerFunc(fn)
@@ -2494,15 +3049,22 @@ func recordResponse(c cache.Cache, duration time.Duration, w http.ResponseWriter
 	content := recorder.Body.Bytes()
 	apiResponse.Response = content
 
-	log.Debugf("caching new page: %s for %s\n", r.RequestURI, duration)
-	apiResponseBytes, err := json.Marshal(apiResponse)
-	if err != nil {
-		log.WithError(err).Warningf("couldn't marshal api response")
+	// Only cache successful responses (2xx status codes)
+	// Don't cache rate limit rejections or other errors
+	if recorder.Code >= 200 && recorder.Code < 300 {
+		log.Debugf("caching new page: %s for %s\n", r.RequestURI, duration)
+		apiResponseBytes, err := json.Marshal(apiResponse)
+		if err != nil {
+			log.WithError(err).Warningf("couldn't marshal api response")
+		}
+
+		if err := c.Set(context.TODO(), r.RequestURI, apiResponseBytes, duration); err != nil {
+			log.WithError(err).Warningf("could not cache page")
+		}
+	} else {
+		log.Debugf("not caching error response (status %d) for %s\n", recorder.Code, r.RequestURI)
 	}
 
-	if err := c.Set(context.TODO(), r.RequestURI, apiResponseBytes, duration); err != nil {
-		log.WithError(err).Warningf("could not cache page")
-	}
 	if _, err := w.Write(content); err != nil {
 		log.WithError(err).Debugf("error writing http response")
 	}

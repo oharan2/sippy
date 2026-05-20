@@ -119,7 +119,7 @@ export function withSort(queryString, sortField, sort) {
 
 export function pathForVariantAnalysis(release, variant) {
   return `/jobs/${release}/analysis?${single(
-    filterFor('variants', 'contains', variant)
+    filterFor('variants', 'has entry', variant)
   )}`
 }
 
@@ -141,7 +141,7 @@ export function pathForExactTestAnalysis(release, test, excludedVariants) {
   let filters = [filterFor('name', 'equals', test)]
   if (Array.isArray(excludedVariants)) {
     excludedVariants.forEach((variant) => {
-      filters.push(not(filterFor('variants', 'contains', variant)))
+      filters.push(not(filterFor('variants', 'has entry', variant)))
     })
   }
 
@@ -174,14 +174,35 @@ export function pathForExactJobRuns(release, job) {
 
 export function pathForVariantsWithTestFailure(release, variant, test) {
   return `/jobs/${release}/runs?${multiple(
-    filterFor('failed_test_names', 'contains', test),
-    filterFor('variants', 'contains', variant)
+    filterFor('failed_test_names', 'has entry', test),
+    filterFor('variants', 'has entry', variant)
   )}`
+}
+
+function last7DaysFilter() {
+  const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000
+  return filterFor('timestamp', '>', `${sevenDaysAgo}`)
 }
 
 export function pathForJobRunsWithTestFailure(release, test, filter) {
   let filters = []
-  filters.push(filterFor('failed_test_names', 'contains', test))
+  filters.push(filterFor('failed_test_names', 'has entry', test))
+  filters.push(last7DaysFilter())
+  if (filter && filter.items) {
+    filter.items.forEach((item) => {
+      if (item.columnField === 'variants') {
+        filters.push(item)
+      }
+    })
+  }
+
+  return `/jobs/${release}/runs?${multiple(...filters)}`
+}
+
+export function pathForJobRunsWithTest(release, test, filter) {
+  let filters = []
+  filters.push(filterFor('ran_test_names', 'has entry', test))
+  filters.push(last7DaysFilter())
   if (filter && filter.items) {
     filter.items.forEach((item) => {
       if (item.columnField === 'variants') {
@@ -195,7 +216,8 @@ export function pathForJobRunsWithTestFailure(release, test, filter) {
 
 export function pathForJobRunsWithTestFlake(release, test, filter) {
   let filters = []
-  filters.push(filterFor('flaked_test_names', 'contains', test))
+  filters.push(filterFor('flaked_test_names', 'has entry', test))
+  filters.push(last7DaysFilter())
   if (filter && filter.items) {
     filter.items.forEach((item) => {
       if (item.columnField === 'variants') {
@@ -260,7 +282,7 @@ export function pathForJobsWithFilter(release, filter) {
 
 export function pathForJobVariant(release, variant) {
   return `/jobs/${release}?${single(
-    filterFor('variants', 'contains', variant)
+    filterFor('variants', 'has entry', variant)
   )}`
 }
 
@@ -282,7 +304,7 @@ export function filterFor(column, operator, value) {
 }
 
 export function withoutUnstable() {
-  return [not(filterFor('variants', 'contains', 'never-stable'))]
+  return [not(filterFor('variants', 'has entry', 'never-stable'))]
 }
 
 export function multiple(...filters) {
@@ -308,22 +330,18 @@ export function not(filter) {
   return filter
 }
 
+// Utility for parsing release versions that include a version like "X.Y"
+// We don't want to be too picky here as the release name could have extra bits like "X.Y-okd"
+// and it's good enough just to know the major and minor version numbers.
+export function parseVersion(versionStr) {
+  const match = String(versionStr).match(/(\d+)\.(\d+)/)
+  if (!match) return {}
+  return { major: Number(match[1]), minor: Number(match[2]) }
+}
+
 export function useNewInstallTests(release) {
-  let digits = release.split('.', 2)
-  if (digits.length < 2) {
-    return false
-  }
-  const major = parseInt(digits[0])
-  const minor = parseInt(digits[1])
-  if (isNaN(major) || isNaN(minor)) {
-    return false
-  }
-  if (major < 4) {
-    return false
-  } else if (major == 4 && minor < 11) {
-    return false
-  }
-  return true
+  const { major, minor } = parseVersion(release)
+  return major > 4 || (major === 4 && minor >= 11)
 }
 
 export function getReportStartDate(reportDate) {

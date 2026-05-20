@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"cloud.google.com/go/bigquery"
+	"github.com/openshift/sippy/pkg/api"
+	bqcachedclient "github.com/openshift/sippy/pkg/bigquery"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -21,19 +23,21 @@ import (
 )
 
 type VariantsGenerateFlags struct {
-	BigQueryFlags     *flags.BigQueryFlags
-	GoogleCloudFlags  *flags.GoogleCloudFlags
-	ConfigFlags       *configflags.ConfigFlags
-	OutputFile        string
-	Mode              string
-	BigqueryJobsTable string
+	BigQueryFlags           *flags.BigQueryFlags
+	GoogleCloudFlags        *flags.GoogleCloudFlags
+	ConfigFlags             *configflags.ConfigFlags
+	ComponentReadinessFlags *flags.ComponentReadinessFlags
+	OutputFile              string
+	Mode                    string
+	BigqueryJobsTable       string
 }
 
 func NewVariantsGenerateFlags() *VariantsGenerateFlags {
 	return &VariantsGenerateFlags{
-		BigQueryFlags:    flags.NewBigQueryFlags(),
-		GoogleCloudFlags: flags.NewGoogleCloudFlags(),
-		ConfigFlags:      configflags.NewConfigFlags(),
+		BigQueryFlags:           flags.NewBigQueryFlags(),
+		GoogleCloudFlags:        flags.NewGoogleCloudFlags(),
+		ConfigFlags:             configflags.NewConfigFlags(),
+		ComponentReadinessFlags: flags.NewComponentReadinessFlags(),
 	}
 }
 
@@ -41,6 +45,7 @@ func (f *VariantsGenerateFlags) BindFlags(fs *pflag.FlagSet) {
 	f.BigQueryFlags.BindFlags(fs)
 	f.GoogleCloudFlags.BindFlags(fs)
 	f.ConfigFlags.BindFlags(fs)
+	f.ComponentReadinessFlags.BindFlags(fs)
 	fs.StringVar(&f.OutputFile, "o", "expected-job-variants.json", "Output json file for job variant data")
 	fs.StringVar(&f.Mode, "mode", "ocp", "Implementation of job variant generator")
 	fs.StringVar(&f.BigqueryJobsTable, "bigquery-jobs-table", "jobs", "Jobs table to load job names from")
@@ -85,18 +90,40 @@ func NewVariantsGenerateCommand() *cobra.Command {
 				return err
 			}
 
+			views, err := f.ComponentReadinessFlags.ParseViewsFile()
+			if err != nil {
+				return err
+			}
+
 			var jsonData []byte
 			switch f.Mode {
 			case "ocp":
 
+				opCtx, ctx := bqcachedclient.OpCtxForCronEnv(ctx, "variants generate")
+
+				bqClient, err := f.BigQueryFlags.GetBigQueryClient(ctx, opCtx, nil, f.GoogleCloudFlags.ServiceAccountCredentialFile)
+				if err != nil {
+					return errors.Wrap(err, "error getting BigQuery client for releases")
+				}
+				releaseConfigs, err := api.GetReleasesFromBigQuery(ctx, bqClient)
+				if err != nil {
+					return errors.Wrap(err, "error loading releases from BigQuery")
+				}
+				syntheticReleaseJobOverrides, err := variantregistry.BuildSyntheticReleaseJobOverrides(config.Releases, releaseConfigs)
+				if err != nil {
+					return errors.Wrap(err, "error building synthetic release job overrides")
+				}
+
 				jvs := variantregistry.NewOCPVariantLoader(
-					bigQueryClient,
+					bigQueryClient, opCtx,
 					f.BigQueryFlags.BigQueryProject,
 					f.BigQueryFlags.BigQueryDataset,
 					f.BigqueryJobsTable,
 					gcsClient,
-					config)
-				expectedVariants, err := jvs.LoadExpectedJobVariants(context.TODO())
+					config,
+					views.ComponentReadiness,
+					syntheticReleaseJobOverrides)
+				expectedVariants, err := jvs.LoadExpectedJobVariants(ctx)
 				if err != nil {
 					return err
 				}

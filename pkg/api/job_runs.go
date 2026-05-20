@@ -14,12 +14,14 @@ import (
 
 	bqlib "cloud.google.com/go/bigquery"
 	"cloud.google.com/go/storage"
+	"github.com/openshift/sippy/pkg/bigquery/bqlabel"
 	"google.golang.org/api/iterator"
 
 	"github.com/hashicorp/go-version"
 	log "github.com/sirupsen/logrus"
 
 	apitype "github.com/openshift/sippy/pkg/apis/api"
+	"github.com/openshift/sippy/pkg/apis/cache"
 	"github.com/openshift/sippy/pkg/apis/openshift"
 	sippyprocessingv1 "github.com/openshift/sippy/pkg/apis/sippyprocessing/v1"
 	"github.com/openshift/sippy/pkg/bigquery"
@@ -79,7 +81,33 @@ type apiRunResults []apitype.JobRun
 func JobsRunsReportFromDB(dbc *db.DB, filterOpts *filter.FilterOptions, release string, pagination *apitype.Pagination, reportEnd time.Time) (*apitype.PaginationResult, error) {
 	jobsResult := make([]apitype.JobRun, 0)
 	table := "prow_job_runs_report_matview"
-	q, err := filter.FilterableDBResult(dbc.DB.Table(table), filterOpts, apitype.JobRun{})
+
+	dbQuery := dbc.DB.Table(table)
+
+	// Split out ran_test_names filters — these are handled via a subquery
+	// against prow_job_run_tests rather than a column on the matview.
+	if filterOpts.Filter != nil {
+		ranTestFilter, remainingFilter := filterOpts.Filter.Split([]string{"ran_test_names"})
+		filterOpts.Filter = remainingFilter
+		for _, item := range ranTestFilter.Items {
+			baseSubquery := "EXISTS (SELECT 1 FROM prow_job_run_tests JOIN tests ON tests.id = prow_job_run_tests.test_id WHERE prow_job_run_tests.prow_job_run_id = prow_job_runs_report_matview.id AND tests.name %s ?)"
+			var pattern string
+			switch item.Operator {
+			case filter.OperatorHasEntry, filter.OperatorEquals:
+				baseSubquery = fmt.Sprintf(baseSubquery, "=")
+				pattern = item.Value
+			default:
+				baseSubquery = fmt.Sprintf(baseSubquery, "ILIKE")
+				pattern = fmt.Sprintf("%%%s%%", item.Value)
+			}
+			if item.Not {
+				baseSubquery = "NOT " + baseSubquery
+			}
+			dbQuery = dbQuery.Where(baseSubquery, pattern)
+		}
+	}
+
+	q, err := filter.FilterableDBResult(dbQuery, filterOpts, apitype.JobRun{})
 	if err != nil {
 		return nil, err
 	}
@@ -105,12 +133,41 @@ func JobsRunsReportFromDB(dbc *db.DB, filterOpts *filter.FilterOptions, release 
 	}
 
 	res := q.Scan(&jobsResult)
+	if res.Error != nil {
+		return nil, res.Error
+	}
+
+	// Fetch annotations separately to avoid bloating the materialized view.
+	if len(jobsResult) > 0 {
+		ids := make([]int, len(jobsResult))
+		for i, jr := range jobsResult {
+			ids[i] = jr.ID
+		}
+		var annotations []models.ProwJobRunAnnotation
+		if err := dbc.DB.Where("prow_job_run_id IN ?", ids).Find(&annotations).Error; err != nil {
+			return nil, err
+		}
+		annotationsByRun := make(map[string]apitype.AnnotationMap)
+		for _, a := range annotations {
+			annotationID := strconv.FormatUint(uint64(a.ProwJobRunID), 10)
+			if annotationsByRun[annotationID] == nil {
+				annotationsByRun[annotationID] = make(apitype.AnnotationMap)
+			}
+			annotationsByRun[annotationID][a.Key] = a.Value
+		}
+		for i := range jobsResult {
+			if am, ok := annotationsByRun[strconv.Itoa(jobsResult[i].ID)]; ok {
+				jobsResult[i].Annotations = am
+			}
+		}
+	}
+
 	return &apitype.PaginationResult{
 		Rows:      jobsResult,
 		TotalRows: rowCount,
 		PageSize:  pagination.PerPage,
 		Page:      pagination.Page,
-	}, res.Error
+	}, nil
 }
 
 // FetchJobRun returns a single job run loaded from postgres and populated with the ProwJob and test results.
@@ -254,7 +311,12 @@ func joinSegments(segments []string, start int, separator string) string {
 
 // JobRunRiskAnalysis checks the test failures and linked bugs for a job run, and reports back an estimated
 // risk level for each failed test, and the job run overall.
-func JobRunRiskAnalysis(dbc *db.DB, bqc *bigquery.Client, jobRun *models.ProwJobRun, logger *log.Entry, compareOtherPRs bool) (apitype.ProwJobRunRiskAnalysis, error) {
+func JobRunRiskAnalysis(
+	ctx context.Context, logger *log.Entry,
+	dbc *db.DB, bqc *bigquery.Client, cacheClient cache.Cache,
+	jobRun *models.ProwJobRun,
+	compareOtherPRs bool,
+) (apitype.ProwJobRunRiskAnalysis, error) {
 	logger = logger.WithField("func", "JobRunRiskAnalysis")
 	// If this job is a Presubmit, compare to test results from master, not presubmits, which may perform
 	// worse due to dev code that hasn't merged. We do not presently track presubmits on branches other than
@@ -263,7 +325,7 @@ func JobRunRiskAnalysis(dbc *db.DB, bqc *bigquery.Client, jobRun *models.ProwJob
 	neverStableJob := false
 	if compareRelease == "Presubmits" {
 		// Get latest release from the DB:
-		ar, err := GetReleases(context.Background(), bqc, false)
+		ar, err := GetReleases(ctx, bqc, false)
 		if err != nil {
 			return apitype.ProwJobRunRiskAnalysis{}, err
 		}
@@ -313,23 +375,25 @@ func JobRunRiskAnalysis(dbc *db.DB, bqc *bigquery.Client, jobRun *models.ProwJob
 
 	if totalJobRuns < 20 {
 		// go back to the prior release and get more jobIds to compare against
-		if currentVersion, err := version.NewVersion(compareRelease); err != nil {
-			logger.WithError(err).Errorf("Failed to parse release '%s' for prow job %d", compareRelease, jobRun.ProwJob.ID)
+		releases, err := GetReleases(ctx, bqc, false)
+		if err != nil {
+			logger.WithError(err).Error("Failed to get releases for prior release lookup")
 		} else {
-			majminor := currentVersion.Segments()
-			// 4.14 is returned as 4,14,0
-			if len(majminor) == 3 && majminor[1] > 0 {
-				majminor[1]--
-				priorRelease := fmt.Sprintf("%d.%d", majminor[0], majminor[1])
+			var priorRelease string
+			for _, r := range releases {
+				if r.Release == compareRelease && r.PreviousRelease != "" {
+					priorRelease = r.PreviousRelease
+					break
+				}
+			}
+			if priorRelease != "" {
 				priorJobNames, _, err := findReleaseMatchJobNames(dbc, jobRun, priorRelease, logger)
-
 				if err != nil {
 					// since this is for the prior release we won't return the never-stable error in this case
 					if err.Error() != "never-stable" {
 						logger.WithError(err).Errorf("Failed to find matching jobIds for: %s", jobRun.ProwJob.Name)
 					}
 				}
-
 				jobNames = append(jobNames, priorJobNames...)
 			}
 		}
@@ -360,7 +424,12 @@ func JobRunRiskAnalysis(dbc *db.DB, bqc *bigquery.Client, jobRun *models.ProwJob
 		}
 	}
 
-	return runJobRunAnalysis(bqc, jobRun, compareRelease, historicalCount, neverStableJob, jobNames, logger, jobNamesTestResultFunc(dbc), variantsTestResultFunc(dbc), compareOtherPRs)
+	return runJobRunAnalysis(ctx,
+		bqc, jobRun, compareRelease, historicalCount, neverStableJob, jobNames, logger,
+		jobNamesTestResultFunc(dbc),
+		variantsTestResultFunc(ctx, dbc, cacheClient),
+		compareOtherPRs,
+	)
 }
 
 // testResultsByJobNameFunc is used for injecting db responses in unit tests.
@@ -390,7 +459,7 @@ func jobNamesTestResultFunc(dbc *db.DB) testResultsByJobNameFunc {
 }
 
 // variantsTestResultFunc looks to match job runs based on variant matches
-func variantsTestResultFunc(dbc *db.DB) testResultsByVariantsFunc {
+func variantsTestResultFunc(ctx context.Context, dbc *db.DB, cacheClient cache.Cache) testResultsByVariantsFunc {
 	return func(testName, release, suite string, variants []string, jobNames []string) (*apitype.Test, error) {
 
 		fil := &filter.Filter{
@@ -404,22 +473,28 @@ func variantsTestResultFunc(dbc *db.DB) testResultsByVariantsFunc {
 			},
 			LinkOperator: "and",
 		}
-		testResults, overallTest, err := BuildTestsResults(dbc, release, "default", false, true,
-			fil)
+		spec := TestResultsSpec{
+			Release:        release,
+			Period:         "default",
+			Collapse:       false,
+			IncludeOverall: true,
+			Filter:         fil,
+		}
+		result, err := spec.buildTestsResultsFromPostgres(ctx, dbc, cacheClient)
 		if err != nil {
 			return nil, err
 		}
-		if overallTest != nil {
-			overallTest.Variants = append(overallTest.Variants, "Overall")
+		if result.Test != nil {
+			result.Test.Variants = append(result.Test.Variants, "Overall")
 		}
 		gosort.Strings(variants)
-		for _, testResult := range testResults {
+		for _, testResult := range result.TestsAPIResult {
 			// this is a weird way to get the variant we want, but it allows re-use
 			// of the existing code.
 			gosort.Strings(testResult.Variants)
 			if stringSlicesEqual(variants, testResult.Variants) && testResult.SuiteName == suite {
-				if overallTest.CurrentPassPercentage < testResult.CurrentPassPercentage {
-					return overallTest, nil
+				if result.Test.CurrentPassPercentage < testResult.CurrentPassPercentage {
+					return result.Test, nil
 				}
 				return &testResult, nil
 			}
@@ -428,12 +503,12 @@ func variantsTestResultFunc(dbc *db.DB) testResultsByVariantsFunc {
 		// otherwise, what is our best match...
 		// do something more expensive and check to see
 		// which testResult contains all the variants we have currently
-		for _, testResult := range testResults {
+		for _, testResult := range result.TestsAPIResult {
 			// we didn't find an exact variant match
 			// next best guess is the first variant list that contains all of our known variants
 			if stringSubSlicesEqual(variants, testResult.Variants) && testResult.SuiteName == suite {
-				if overallTest.CurrentPassPercentage < testResult.CurrentPassPercentage {
-					return overallTest, nil
+				if result.Test.CurrentPassPercentage < testResult.CurrentPassPercentage {
+					return result.Test, nil
 				}
 				return &testResult, nil
 			}
@@ -443,8 +518,7 @@ func variantsTestResultFunc(dbc *db.DB) testResultsByVariantsFunc {
 	}
 }
 
-func runJobRunAnalysis(bqc *bigquery.Client, jobRun *models.ProwJobRun, compareRelease string, historicalRunTestCount int, neverStableJob bool, jobNames []string, logger *log.Entry,
-	testResultsJobNameFunc testResultsByJobNameFunc, testResultsVariantsFunc testResultsByVariantsFunc, compareOtherPRs bool) (apitype.ProwJobRunRiskAnalysis, error) {
+func runJobRunAnalysis(ctx context.Context, bqc *bigquery.Client, jobRun *models.ProwJobRun, compareRelease string, historicalRunTestCount int, neverStableJob bool, jobNames []string, logger *log.Entry, testResultsJobNameFunc testResultsByJobNameFunc, testResultsVariantsFunc testResultsByVariantsFunc, compareOtherPRs bool) (apitype.ProwJobRunRiskAnalysis, error) {
 
 	logger = logger.WithField("func", "runJobRunAnalysis").WithField("job", jobRun.ProwJob.Name)
 	logger.Infof("analyzing prow job run with %d failed test(s)", len(jobRun.Tests))
@@ -501,7 +575,7 @@ func runJobRunAnalysis(bqc *bigquery.Client, jobRun *models.ProwJobRun, compareR
 		}
 
 		loggerFields := logger.WithField("test", ft.Test.Name)
-		analysis, err := runTestRunAnalysis(bqc, ft, jobRun, compareRelease, loggerFields, testResultsJobNameFunc, jobNames, testResultsVariantsFunc, neverStableJob, compareOtherPRs)
+		analysis, err := runTestRunAnalysis(ctx, bqc, ft, jobRun, compareRelease, loggerFields, testResultsJobNameFunc, jobNames, testResultsVariantsFunc, neverStableJob, compareOtherPRs)
 		if err != nil {
 			continue // ignore runs where analysis failed
 		}
@@ -520,7 +594,7 @@ func runJobRunAnalysis(bqc *bigquery.Client, jobRun *models.ProwJobRun, compareR
 
 // For a failed test, query its pass rates by NURPs, find a matching variant combo, and
 // see how often we've passed in the last week.
-func runTestRunAnalysis(bqc *bigquery.Client, failedTest models.ProwJobRunTest, jobRun *models.ProwJobRun, compareRelease string, logger *log.Entry, testResultsJobNameFunc testResultsByJobNameFunc, jobNames []string, testResultsVariantsFunc testResultsByVariantsFunc, neverStableJob, compareOtherPRs bool) (apitype.TestRiskAnalysis, error) {
+func runTestRunAnalysis(ctx context.Context, bqc *bigquery.Client, failedTest models.ProwJobRunTest, jobRun *models.ProwJobRun, compareRelease string, logger *log.Entry, testResultsJobNameFunc testResultsByJobNameFunc, jobNames []string, testResultsVariantsFunc testResultsByVariantsFunc, neverStableJob, compareOtherPRs bool) (apitype.TestRiskAnalysis, error) {
 	logger.Debug("failed test")
 
 	var testResultsJobNames, testResultsVariants *apitype.Test
@@ -571,7 +645,7 @@ func runTestRunAnalysis(bqc *bigquery.Client, failedTest models.ProwJobRunTest, 
 	if (testResultsVariants != nil && testResultsVariants.CurrentRuns > 0) || (testResultsJobNames != nil && testResultsJobNames.CurrentRuns > 0) {
 		// select the 'best' test result
 		risk := selectRiskAnalysisResult(testResultsJobNames, testResultsVariants, jobNames, compareRelease)
-		if compareOtherPRs && risk.Level.Level >= apitype.FailureRiskLevelHigh.Level && len(jobRun.PullRequests) > 0 && isHighRiskInOtherPRs(bqc, failedTest, jobRun) {
+		if compareOtherPRs && risk.Level.Level >= apitype.FailureRiskLevelHigh.Level && isHighRiskInOtherPRs(ctx, bqc, failedTest, jobRun) {
 			// If the same test/job has high risk in other PRs, we override the risk level
 			analysis.Risk = apitype.TestFailureRisk{
 				Level: apitype.FailureRiskLevelMedium,
@@ -594,7 +668,10 @@ func runTestRunAnalysis(bqc *bigquery.Client, failedTest models.ProwJobRunTest, 
 	return analysis, nil
 }
 
-func isHighRiskInOtherPRs(bqc *bigquery.Client, failedTest models.ProwJobRunTest, jobRun *models.ProwJobRun) bool {
+func isHighRiskInOtherPRs(ctx context.Context, bqc *bigquery.Client, failedTest models.ProwJobRunTest, jobRun *models.ProwJobRun) bool {
+	if len(jobRun.PullRequests) == 0 {
+		return false
+	}
 	pr := jobRun.PullRequests[0]
 	endTime := jobRun.Timestamp.Add(jobRun.Duration)
 	if jobRun.Timestamp.IsZero() {
@@ -605,18 +682,51 @@ func isHighRiskInOtherPRs(bqc *bigquery.Client, failedTest models.ProwJobRunTest
 	if !found {
 		return false
 	}
-	queryStr := `SELECT COUNT(*) FROM ` +
-		fmt.Sprintf("%s.%s.%s", "openshift-ci-data-analysis", "ci_data_autodl", "risk_analysis_test_results") +
-		fmt.Sprintf(" INNER JOIN %s.%s.%s jobs", "openshift-gce-devel", "ci_analysis_us", "jobs") +
-		` ON JobRunName=jobs.prowjob_build_id` +
-		fmt.Sprintf(" WHERE PartitionTime BETWEEN TIMESTAMP('%s') AND TIMESTAMP('%s') AND", endTime.Add(-12*time.Hour).Format(time.RFC3339), endTime.Add(3*time.Hour).Format(time.RFC3339)) +
-		`  RiskLevel>=100 AND` +
-		fmt.Sprintf("  TestName='%s' AND", failedTest.Test.Name) +
-		fmt.Sprintf("  (org!='%s' OR repo!='%s' OR pr_number!='%d') AND", pr.Org, pr.Repo, pr.Number) +
-		fmt.Sprintf("  prowjob_job_name LIKE '%%%s'", jobSuffix)
-	q := bqc.BQ.Query(queryStr)
 
-	it, err := q.Read(context.TODO())
+	queryStr := `
+		SELECT COUNT(*)
+		FROM ` + "`openshift-ci-data-analysis.ci_data_autodl.risk_analysis_test_results`" + `
+		INNER JOIN ` + "`openshift-gce-devel.ci_analysis_us.jobs`" + ` jobs
+		  ON JobRunName=jobs.prowjob_build_id
+		WHERE PartitionTime BETWEEN TIMESTAMP(@StartTime) AND TIMESTAMP(@EndTime)
+		  AND RiskLevel >= 100
+		  AND TestName = @TestName
+		  AND (org != @Org OR repo != @Repo OR pr_number != @PRNumber)
+		  AND prowjob_job_name LIKE @JobPattern`
+
+	q := bqc.Query(ctx, bqlabel.JobRunHighRisk, queryStr)
+	q.Parameters = []bqlib.QueryParameter{
+		{
+			Name:  "StartTime",
+			Value: endTime.Add(-12 * time.Hour).Format(time.RFC3339),
+		},
+		{
+			Name:  "EndTime",
+			Value: endTime.Add(3 * time.Hour).Format(time.RFC3339),
+		},
+		{
+			Name:  "TestName",
+			Value: failedTest.Test.Name,
+		},
+		{
+			Name:  "Org",
+			Value: pr.Org,
+		},
+		{
+			Name:  "Repo",
+			Value: pr.Repo,
+		},
+		{
+			Name:  "PRNumber",
+			Value: fmt.Sprintf("%d", pr.Number),
+		},
+		{
+			Name:  "JobPattern",
+			Value: "%" + jobSuffix,
+		},
+	}
+
+	it, err := q.Read(ctx)
 	if err != nil {
 		log.WithError(err).Error("Failed querying high risk items from bigquery")
 		return false

@@ -11,24 +11,24 @@ import (
 	"time"
 
 	"github.com/andygrunwald/go-jira"
+	"github.com/openshift/sippy/pkg/api/componentreadiness"
+	"github.com/openshift/sippy/pkg/api/componentreadiness/dataprovider"
 	"github.com/openshift/sippy/pkg/api/componentreadiness/utils"
+	crtype "github.com/openshift/sippy/pkg/apis/api/componentreport"
 	"github.com/openshift/sippy/pkg/apis/api/componentreport/crtest"
 	"github.com/openshift/sippy/pkg/apis/api/componentreport/crview"
 	"github.com/openshift/sippy/pkg/apis/api/componentreport/reqopts"
-	log "github.com/sirupsen/logrus"
-	"github.com/trivago/tgo/tcontainer"
-	"google.golang.org/api/iterator"
-	jirautil "sigs.k8s.io/prow/pkg/jira"
-
-	"github.com/openshift/sippy/pkg/api/componentreadiness"
-	crtype "github.com/openshift/sippy/pkg/apis/api/componentreport"
 	"github.com/openshift/sippy/pkg/apis/cache"
-	configv1 "github.com/openshift/sippy/pkg/apis/config/v1"
 	jiratype "github.com/openshift/sippy/pkg/apis/jira/v1"
 	v1 "github.com/openshift/sippy/pkg/apis/sippy/v1"
 	bqclient "github.com/openshift/sippy/pkg/bigquery"
+	"github.com/openshift/sippy/pkg/bigquery/bqlabel"
 	"github.com/openshift/sippy/pkg/db"
+	"github.com/openshift/sippy/pkg/util"
 	"github.com/openshift/sippy/pkg/util/sets"
+	log "github.com/sirupsen/logrus"
+	"github.com/trivago/tgo/tcontainer"
+	"google.golang.org/api/iterator"
 )
 
 const (
@@ -50,8 +50,9 @@ type JiraComponent struct {
 }
 
 type JiraAutomator struct {
-	jiraClient   jirautil.Client
+	jiraClient   *jira.Client
 	bqClient     *bqclient.Client
+	dataProvider dataprovider.DataProvider
 	dbc          *db.DB
 	cacheOptions cache.RequestOptions
 	views        []crview.View
@@ -60,17 +61,17 @@ type JiraAutomator struct {
 	// columnThresholds defines a threshold for the number of red cells in a column.
 	// When the number of red cells of a column is over this threshold, a jira card will be created for the
 	// Variant (column) based jira component. No other jira cards will be created per component row.
-	columnThresholds           map[Variant]int
-	includeComponents          sets.String
-	jiraAccount                string
-	dryRun                     bool
-	variantToJiraComponents    map[Variant]JiraComponent
-	variantJunitTableOverrides []configv1.VariantJunitTableOverride
+	columnThresholds        map[Variant]int
+	includeComponents       sets.String
+	jiraAccount             string
+	dryRun                  bool
+	variantToJiraComponents map[Variant]JiraComponent
 }
 
 func NewJiraAutomator(
-	jiraClient jirautil.Client,
+	jiraClient *jira.Client,
 	bqClient *bqclient.Client,
+	provider dataprovider.DataProvider,
 	dbc *db.DB,
 	cacheOptions cache.RequestOptions,
 	views []crview.View,
@@ -80,22 +81,21 @@ func NewJiraAutomator(
 	columnThresholds map[Variant]int,
 	dryRun bool,
 	variantToJiraComponents map[Variant]JiraComponent,
-	variantJunitTableOverrides []configv1.VariantJunitTableOverride,
 ) (JiraAutomator, error) {
 
 	j := JiraAutomator{
-		jiraClient:                 jiraClient,
-		bqClient:                   bqClient,
-		dbc:                        dbc,
-		cacheOptions:               cacheOptions,
-		releases:                   releases,
-		sippyURL:                   sippyURL,
-		columnThresholds:           columnThresholds,
-		includeComponents:          includeComponents,
-		jiraAccount:                jiraAccount,
-		dryRun:                     dryRun,
-		variantToJiraComponents:    variantToJiraComponents,
-		variantJunitTableOverrides: variantJunitTableOverrides,
+		jiraClient:              jiraClient,
+		bqClient:                bqClient,
+		dataProvider:            provider,
+		dbc:                     dbc,
+		cacheOptions:            cacheOptions,
+		releases:                releases,
+		sippyURL:                sippyURL,
+		columnThresholds:        columnThresholds,
+		includeComponents:       includeComponents,
+		jiraAccount:             jiraAccount,
+		dryRun:                  dryRun,
+		variantToJiraComponents: variantToJiraComponents,
 	}
 	if bqClient == nil || bqClient.BQ == nil {
 		return j, fmt.Errorf("we don't have a bigquery client for jira integrator")
@@ -148,7 +148,7 @@ func (j JiraAutomator) getComponentReportForView(view crview.View) (crtype.Compo
 	}
 
 	// Passing empty gcs bucket and prow URL, they are not needed outside test details reports
-	report, errs := componentreadiness.GetComponentReportFromBigQuery(context.Background(), j.bqClient, j.dbc, reportOpts, j.variantJunitTableOverrides, "")
+	report, errs := componentreadiness.GetComponentReport(context.Background(), j.dataProvider, j.dbc, reportOpts, "")
 	if len(errs) > 0 {
 		var strErrors []string
 		for _, err := range errs {
@@ -177,7 +177,7 @@ func (j JiraAutomator) getExistingIssuesForComponent(view crview.View, component
 	}
 	jqlQuery := fmt.Sprintf("project=%s&&component='%s'&&creator='%s'&&affectedVersion=%s&&labels in (%s) ORDER BY createdDate",
 		component.Project, component.Component, j.jiraAccount, view.SampleRelease.Name, jiratype.LabelJiraAutomator)
-	issues, _, err := j.jiraClient.SearchWithContext(context.Background(), jqlQuery, &searchOptions)
+	issues, _, err := j.jiraClient.Issue.SearchWithContext(context.Background(), jqlQuery, &searchOptions)
 	return issues, err
 }
 
@@ -201,7 +201,7 @@ func isReleaseBlockerApproved(existing *jira.Issue) bool {
 		Value    string `json:"value"`
 	}
 	var obj *releaseBlockerField
-	err := jirautil.GetUnknownField(jiratype.CustomFieldReleaseBlockerName, existing, func() interface{} {
+	err := util.GetUnknownField(jiratype.CustomFieldReleaseBlockerName, existing, func() interface{} {
 		obj = &releaseBlockerField{}
 		return obj
 	})
@@ -223,10 +223,11 @@ func (j JiraAutomator) updateExistingJiraIssue(view crview.View, existing *jira.
 
 	if j.dryRun {
 		fmt.Fprintf(os.Stdout, "\n====================================================================\n")
+		fmt.Fprintf(os.Stdout, "\nRunning in DRY RUN mode!\n")
 		fmt.Fprintf(os.Stdout, "\nUpdating issue %s with comment\n%s", existing.ID, comment)
 		fmt.Fprintf(os.Stdout, "\n====================================================================\n")
 	} else {
-		_, err = j.jiraClient.AddComment(existing.ID, &jira.Comment{Body: comment})
+		_, _, err = j.jiraClient.Issue.AddComment(existing.ID, &jira.Comment{Body: comment})
 		if err != nil {
 			return err
 		}
@@ -336,31 +337,15 @@ func (j JiraAutomator) createNewJiraIssueForRegressions(view crview.View, compon
 		description += "\n * Please do not remove 'Release Blocker' label. The bot will automatically add it back if any regressed tests continue showing for the component.\n"
 
 		summary := fmt.Sprintf("Component Readiness: %s test regressed", component.Component)
-		issue := jira.Issue{
-			Fields: &jira.IssueFields{
-				Description: description,
-				Type: jira.IssueType{
-					Name: "Bug",
-				},
-				Project: jira.Project{
-					Key: component.Project,
-				},
-				Components: []*jira.Component{
-					{
-						Name: component.Component,
-					},
-				},
-				Summary: summary,
-				AffectsVersions: []*jira.AffectsVersion{
-					{
-						Name: view.SampleRelease.Name,
-					},
-				},
-				Labels: []string{jiratype.LabelJiraAutomator},
-			},
+
+		fileBugRequest := util.FileBugRequest{Description: description, Summary: summary, Components: []string{component.Component}, AffectsVersions: []string{view.SampleRelease.Name}, Labels: []string{jiratype.LabelJiraAutomator}, Project: component.Project}
+		issue, err := util.PopulateJiraIssue(j.jiraClient, fileBugRequest, "")
+		if err != nil {
+			return err
 		}
+
 		if !j.dryRun {
-			created, err := j.jiraClient.CreateIssue(&issue)
+			created, _, err := j.jiraClient.Issue.Create(&issue)
 			if err != nil {
 				return err
 			}
@@ -372,6 +357,9 @@ func (j JiraAutomator) createNewJiraIssueForRegressions(view crview.View, compon
 			return err
 		}
 		fmt.Fprintf(os.Stdout, "\n====================================================================\n")
+		if j.dryRun {
+			fmt.Fprintf(os.Stdout, "\nRunning in DRY RUN mode!\n")
+		}
 		fmt.Fprintf(os.Stdout, "Creating the following jira issue\n%s", issueStr)
 		fmt.Fprintf(os.Stdout, "\n====================================================================\n")
 	}
@@ -471,6 +459,7 @@ func (j JiraAutomator) updateJiraIssueForRegressions(issue jira.Issue, view crvi
 }
 
 func (j JiraAutomator) updateReleaseBlocker(issue *jira.Issue, release string) error {
+	// CustomFieldReleaseBlockerName will need to be updated when migrating to atlassian cloud
 	if j.isPreRelease(release) {
 		unknowns := tcontainer.NewMarshalMap()
 		unknowns[jiratype.CustomFieldReleaseBlockerName] = map[string]string{"value": jiratype.CustomFieldReleaseBlockerValueApproved}
@@ -481,10 +470,13 @@ func (j JiraAutomator) updateReleaseBlocker(issue *jira.Issue, release string) e
 			},
 		}
 		if !j.dryRun {
-			_, err := j.jiraClient.UpdateIssue(&issue)
+			_, _, err := j.jiraClient.Issue.Update(&issue)
 			return err
 		}
 		fmt.Fprintf(os.Stdout, "\n====================================================================\n")
+		if j.dryRun {
+			fmt.Fprintf(os.Stdout, "\nRunning in DRY RUN mode!\n")
+		}
 		fmt.Fprintf(os.Stdout, "Updating Release Blocker for %s", issue.ID)
 		fmt.Fprintf(os.Stdout, "\n====================================================================\n")
 	}
@@ -616,7 +608,7 @@ func GetVariantJiraMap(ctx context.Context, bqClient *bqclient.Client) (map[Vari
 	result := map[Variant]JiraComponent{}
 
 	queryString := "SELECT * FROM openshift-gce-devel.ci_analysis_us.variant_mapping_latest"
-	q := bqClient.BQ.Query(queryString)
+	q := bqClient.Query(ctx, bqlabel.VariantJiraMap, queryString)
 	it, err := q.Read(ctx)
 	if err != nil {
 		log.WithError(err).Error("error querying variant mapping data from bigquery")
